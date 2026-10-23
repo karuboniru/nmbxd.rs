@@ -125,3 +125,14 @@ HTTP(S) 外链通过系统默认浏览器打开，保留 HTML 链接的目标地
 - **知道订阅 ID 的人可以查看和修改这份订阅**，请妥善保存；它独立于 cookie，使用订阅不需要发帖饼干。
 - API 没有单串订阅状态查询；仅使用已加载订阅页和本次成功操作判断“已订阅”，不为了检查状态拉取整个收藏夹。未知状态允许直接添加，服务器重复添加不产生重复收藏。共享列表在其他设备变化后请刷新。
 - 订阅读写和错误处理已用本地 HTTP 模拟服务测试，未更改真实服务器订阅；另已只读验证随机 ID 的空订阅列表。隔离 X11 会话已验证嵌套预览、Esc / 鼠标后退逐层关闭、原图 Esc 关闭和订阅设置界面。
+
+## GitHub Actions 构建与发布
+
+[构建记录与下载](https://github.com/karuboniru/nmbxd.rs/actions/workflows/build.yml) · [正式发布](https://github.com/karuboniru/nmbxd.rs/releases)
+
+- 每次向任意分支 push、推送 tag，以及 PR 更新，自动在 **Ubuntu 24.04 x86_64** 上运行单元测试、构建 release 并打包。也可在 Actions 页面手动运行。一次 push 多个提交时构建该 push 的最终提交；不取消旧构建。
+- 成功后，在该次运行页面的 **Artifacts** 下载 `nmbxd-linux-x86_64-提交SHA`，内含 `.tar.gz` 和 `.sha256`；保留 30 天。GitHub 的 artifact 下载外层是 ZIP，解开后再解压里面的 tar 包并运行安装脚本。
+- 推送任意 tag 时，同一份已测试产物自动上传到该 tag 的 **GitHub Release**，不必从 Actions 下载。不会自动创建 tag；手动运行 tag 工作流不会额外发布 Release。重跑 tag 构建会更新该 Release 的同名附件。
+- 推荐先更新 `Cargo.toml` / `Cargo.lock` 版本并提交，再执行 `git tag v0.1.4 && git push origin v0.1.4`（版本号按实际填写）。压缩包名使用 Cargo 版本，Release 名使用 tag。
+- 构建只使用仓库源码，不需要配置 cookie 或任何自定义 secret；仅发布 job 使用 GitHub 自动提供的 `GITHUB_TOKEN` 写入 Release。PR job 没有仓库写权限。
+- Ubuntu 产物仍是动态链接程序，不是通用静态包；运行目标需有兼容的 glibc / 系统库。包内 `BUILD-OS.txt` 与 `DEPENDENCIES.txt` 可用于检查。不在 CI 中启动 GUI，也不向岛上发送内容。
