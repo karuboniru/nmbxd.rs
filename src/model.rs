@@ -167,27 +167,7 @@ impl Post {
 /// Render the API's small HTML fragments as text. Decode entities *after*
 /// removing markup, so escaped angle brackets in users' text remain visible.
 pub fn html_to_text(html: &str) -> String {
-    static SCRIPT: OnceLock<Regex> = OnceLock::new();
-    static STYLE: OnceLock<Regex> = OnceLock::new();
-    static BREAK: OnceLock<Regex> = OnceLock::new();
-    static TAG: OnceLock<Regex> = OnceLock::new();
-    let html = SCRIPT
-        .get_or_init(|| Regex::new(r"(?is)<script\b[^>]*>.*?</script\s*>").unwrap())
-        .replace_all(html, "");
-    let html = STYLE
-        .get_or_init(|| Regex::new(r"(?is)<style\b[^>]*>.*?</style\s*>").unwrap())
-        .replace_all(&html, "");
-    let html = BREAK
-        .get_or_init(|| {
-            Regex::new(r"(?i)<br\s*/?>|</(?:p|div|li|h[1-6]|blockquote|tr)\s*>").unwrap()
-        })
-        .replace_all(&html, "\n");
-    let html = TAG.get_or_init(|| Regex::new(r#"(?s)</?[A-Za-z][A-Za-z0-9]*(?:\s+(?:\"[^\"]*\"|'[^']*'|[^'\">])*)?\s*/?>|<!--.*?-->"#).unwrap()).replace_all(&html, "");
-    html_escape::decode_html_entities(&html)
-        .replace('\u{a0}', " ")
-        .replace("\r\n", "\n")
-        .trim()
-        .to_owned()
+    crate::content::render_text(html)
 }
 
 /// References in visible content, deduplicated in their original order.
@@ -275,6 +255,31 @@ mod tests {
             html_to_text("<a title=\"a > b\" href=\"/t/1\">&gt;&gt;No.12</a>"),
             ">>No.12"
         );
+    }
+
+    #[test]
+    fn paired_html_breaks_render_once_in_both_paths() {
+        for (html, expected) in [
+            ("甲<br>\n乙", "甲\n乙"),
+            ("甲<br />\r\n乙", "甲\n乙"),
+            ("甲<BR/>\r乙", "甲\n乙"),
+            ("甲<br>乙", "甲\n乙"),
+            ("甲<br>\n<br />\r\n乙", "甲\n\n乙"),
+            ("甲<br><br>乙", "甲\n\n乙"),
+            ("甲<br>\n\n乙", "甲\n\n乙"),
+            ("甲<br>\n  乙", "甲\n  乙"),
+            ("甲\n\n乙", "甲\n\n乙"),
+            ("甲\r\n\r\n乙", "甲\n\n乙"),
+            ("甲<br>&#10;乙", "甲\n\n乙"),
+            ("甲&lt;br&gt;\n乙", "甲<br>\n乙"),
+        ] {
+            assert_eq!(html_to_text(html), expected, "text-only: {html:?}");
+            assert_eq!(
+                crate::content::parse_content(html).text,
+                expected,
+                "clickable: {html:?}"
+            );
+        }
     }
 
     #[test]

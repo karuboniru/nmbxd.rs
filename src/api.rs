@@ -234,14 +234,22 @@ impl ApiClient {
     }
 
     pub fn thread_page(&self, id: u64, page: u32) -> Result<Post> {
+        self.thread_page_at(&format!("{API_BASE}thread"), id, page)
+    }
+
+    fn thread_page_at(&self, endpoint: &str, id: u64, page: u32) -> Result<Post> {
         if id == 0 || page == 0 {
             bail!("串号和页码必须大于零");
         }
-        self.read(
+        let post: Post = self.read(
             self.client
-                .get(format!("{API_BASE}thread"))
+                .get(endpoint)
                 .query(&[("id", id.to_string()), ("page", page.to_string())]),
-        )
+        )?;
+        if post.id != id {
+            bail!("服务器返回的主题串号与请求不符");
+        }
+        Ok(post)
     }
 
     /// Server subscriptions belong to this ID, independently of the posting cookie.
@@ -774,6 +782,44 @@ mod tests {
 
     fn read_mock_request(stream: &mut std::net::TcpStream) -> String {
         String::from_utf8(read_mock_request_bytes(stream)).unwrap()
+    }
+
+    #[test]
+    fn thread_pages_reject_a_different_root_id() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for body in [
+                r#"{"id":"456","content":"wrong thread"}"#,
+                r#"{"id":"123","content":"requested thread"}"#,
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                requests.push(read_mock_request(&mut stream));
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            }
+            requests
+        });
+        let api = ApiClient::new(None).unwrap();
+        let endpoint = format!("http://{address}/thread");
+        let error = api.thread_page_at(&endpoint, 123, 2).unwrap_err();
+        assert!(error.to_string().contains("主题串号与请求不符"));
+        let post = api.thread_page_at(&endpoint, 123, 2).unwrap();
+        assert_eq!(post.id, 123);
+        assert_eq!(post.content, "requested thread");
+        let requests = server.join().unwrap();
+        assert!(
+            requests
+                .iter()
+                .all(|request| { request.starts_with("GET /thread?id=123&page=2 HTTP/1.1") })
+        );
     }
 
     fn test_image(format: image::ImageFormat) -> Vec<u8> {

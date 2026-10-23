@@ -218,6 +218,7 @@ impl Island {
                     return;
                 }
                 self.selected = Some(post.id);
+                self.reader_target_changed();
                 self.thread_epoch += 1;
                 self.navigation = Navigation::default();
                 self.navigation.request(1, PageMode::Navigate);

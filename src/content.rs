@@ -26,8 +26,64 @@ pub struct ParsedContent {
 /// destinations survive rendering, while plain references and web URLs are
 /// discovered in text outside those anchors.
 pub fn parse_content(html: &str) -> ParsedContent {
-    static TAG: OnceLock<Regex> = OnceLock::new();
     static PLAIN_LINK: OnceLock<Regex> = OnceLock::new();
+    let mut parsed = render_html(html);
+    let text = &parsed.text;
+    let links = &mut parsed.links;
+    // Match visible strings only, after decoding HTML entities. Anchor ranges
+    // retain priority even if their label resembles a different destination.
+    let plain = PLAIN_LINK.get_or_init(|| {
+        Regex::new(r#"(?i)https?://[^\s<>\"']+|(?:>>\s*(?:No\.\s*)?|No\.\s*)([0-9]+)"#).unwrap()
+    });
+    let anchor_count = links.len();
+    for capture in plain.captures_iter(text) {
+        let matched = capture.get(0).unwrap();
+        if matched
+            .as_str()
+            .get(..3)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("No."))
+            && text[..matched.start()]
+                .chars()
+                .next_back()
+                .is_some_and(|character| character.is_ascii_alphanumeric() || character == '_')
+        {
+            continue;
+        }
+        let (end, target) = if let Some(id) = capture.get(1) {
+            let Some(id) = positive_id(id.as_str()) else {
+                continue;
+            };
+            (matched.end(), LinkTarget::Reference(id))
+        } else {
+            let url = trim_url_punctuation(matched.as_str());
+            let Some(target) = link_target(url) else {
+                continue;
+            };
+            (matched.start() + url.len(), target)
+        };
+        let range = matched.start()..end;
+        let next_anchor =
+            links[..anchor_count].partition_point(|link| link.range.end <= range.start);
+        if links[..anchor_count]
+            .get(next_anchor)
+            .is_some_and(|link| ranges_overlap(&range, &link.range))
+        {
+            continue;
+        }
+        links.push(ContentLink { range, target });
+    }
+
+    links.sort_by_key(|link| link.range.start);
+    parsed
+}
+
+/// Text-only callers share the renderer without scanning for clickable links.
+pub(crate) fn render_text(html: &str) -> String {
+    render_html(html).text
+}
+
+fn render_html(html: &str) -> ParsedContent {
+    static TAG: OnceLock<Regex> = OnceLock::new();
     let tags = TAG.get_or_init(|| {
         Regex::new(r#"(?is)<!--.*?-->|</?([a-z][a-z0-9]*)\b(?:[^'\"<>]|\"[^\"]*\"|'[^']*')*>"#)
             .unwrap()
@@ -79,55 +135,26 @@ pub fn parse_content(html: &str) -> ParsedContent {
                 )
         {
             text.push('\n');
+            if name == "br" {
+                // The API uses nl2br-style fragments: the tag and the one
+                // immediately following source newline represent one break.
+                // Consume only that newline so repeated tags, extra blank
+                // lines, indentation, and entity-encoded newlines survive.
+                let source = &html[cursor..];
+                cursor += if source.starts_with("\r\n") {
+                    2
+                } else if source.starts_with(['\n', '\r']) {
+                    1
+                } else {
+                    0
+                };
+            }
         }
     }
     if hidden.is_none() {
         append_text(&mut text, &html[cursor..]);
     }
     finish_anchor(&mut anchor, &mut links, text.len());
-
-    // Match visible strings only, after decoding HTML entities. Anchor ranges
-    // retain priority even if their label resembles a different destination.
-    let plain = PLAIN_LINK.get_or_init(|| {
-        Regex::new(r#"(?i)https?://[^\s<>\"']+|(?:>>\s*(?:No\.\s*)?|No\.\s*)([0-9]+)"#).unwrap()
-    });
-    let anchor_count = links.len();
-    for capture in plain.captures_iter(&text) {
-        let matched = capture.get(0).unwrap();
-        if matched
-            .as_str()
-            .get(..3)
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("No."))
-            && text[..matched.start()]
-                .chars()
-                .next_back()
-                .is_some_and(|character| character.is_ascii_alphanumeric() || character == '_')
-        {
-            continue;
-        }
-        let (end, target) = if let Some(id) = capture.get(1) {
-            let Some(id) = positive_id(id.as_str()) else {
-                continue;
-            };
-            (matched.end(), LinkTarget::Reference(id))
-        } else {
-            let url = trim_url_punctuation(matched.as_str());
-            let Some(target) = link_target(url) else {
-                continue;
-            };
-            (matched.start() + url.len(), target)
-        };
-        let range = matched.start()..end;
-        let next_anchor =
-            links[..anchor_count].partition_point(|link| link.range.end <= range.start);
-        if links[..anchor_count]
-            .get(next_anchor)
-            .is_some_and(|link| ranges_overlap(&range, &link.range))
-        {
-            continue;
-        }
-        links.push(ContentLink { range, target });
-    }
 
     // Preserve the existing renderer's outer whitespace trimming, adjusting all
     // ranges together so offsets stay valid for CJK and emoji.
@@ -142,7 +169,6 @@ pub fn parse_content(html: &str) -> ParsedContent {
         link.range = (left - start)..(right - start);
         true
     });
-    links.sort_by_key(|link| link.range.start);
     ParsedContent {
         text: text.trim().to_owned(),
         links,
@@ -333,6 +359,25 @@ mod tests {
         assert_eq!(parsed.text, "中文 😀 & 👩‍💻\n  >>No.12\n<b>literal</b>");
         assert_eq!(labels(&parsed), vec![">>No.12"]);
         assert_eq!(parsed.links[0].target, LinkTarget::Reference(12));
+    }
+
+    #[test]
+    fn paired_source_breaks_preserve_layout_and_utf8_link_ranges() {
+        let parsed = parse_content(
+            " 中文😀<br />\r\n<a href='/t/42'>引用🎉</a><br>\n&gt;&gt;No.12<br>\nhttps://example.com/路径 ",
+        );
+        assert_eq!(
+            parsed.text,
+            "中文😀\n引用🎉\n>>No.12\nhttps://example.com/路径"
+        );
+        assert_eq!(
+            labels(&parsed),
+            vec!["引用🎉", ">>No.12", "https://example.com/路径"]
+        );
+        assert_eq!(parsed.links[0].target, LinkTarget::Reference(42));
+        assert_eq!(parsed.links[1].target, LinkTarget::Reference(12));
+        assert_eq!(parsed.links[0].range.start, "中文😀\n".len());
+        assert!(matches!(parsed.links[2].target, LinkTarget::External(_)));
     }
 
     #[test]

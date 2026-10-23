@@ -1,10 +1,13 @@
 mod appearance;
 mod assets;
 mod attachments;
+mod drafts;
 mod emoji;
 mod image_actions;
 mod image_clipboard;
 mod image_export;
+mod kaomoji;
+mod kaomoji_picker;
 mod media;
 mod media_view;
 mod navigation;
@@ -62,7 +65,14 @@ enum Response {
     Sent(Result<String, String>),
 }
 
+struct ComposerDraft {
+    body: Entity<InputState>,
+    title: Entity<InputState>,
+    attachment: Option<attachments::DraftImage>,
+}
+
 struct Island {
+    drafts: drafts::Drafts<ComposerDraft>,
     image_export_busy: bool,
     content_views: std::cell::RefCell<
         std::collections::VecDeque<(
@@ -110,6 +120,7 @@ struct Island {
     aggregate: bool,
     collapsed: HashSet<u64>,
     composing: bool,
+    kaomoji_open: bool,
     compose_target: Option<u64>,
     compose_forum: i64,
     compose_label: String,
@@ -295,6 +306,8 @@ impl Island {
             aggregate: false,
             collapsed: HashSet::new(),
             composing: false,
+            kaomoji_open: false,
+            drafts: drafts::Drafts::default(),
             compose_target: None,
             compose_forum: 4,
             compose_label: String::new(),
@@ -426,10 +439,12 @@ impl Island {
                     Ok(message) => {
                         self.notice = format!("发送结果：{message}");
                         self.composing = false;
+                        self.kaomoji_open = false;
                         self.clear_draft = true;
                     }
                     Err(e) => {
-                        self.notice = format!("发送未确认，草稿已保留。请先检查串再重试：{e}")
+                        self.notice = format!("发送未确认，草稿已保留。请先检查串再重试：{e}");
+                        self.reader_target_changed();
                     }
                 }
             }
@@ -445,6 +460,7 @@ impl Island {
         self.showing_subscriptions = false;
         self.forum = id;
         self.forum_name = name;
+        self.reader_target_changed();
         self.forum_epoch += 1;
         self.threads.clear();
         self.forum_page = 0;
@@ -458,6 +474,7 @@ impl Island {
             return;
         }
         self.selected = Some(id);
+        self.reader_target_changed();
         self.tree = None;
         self.navigation = Navigation::default();
         self.reset_reading_scroll();
@@ -635,6 +652,28 @@ impl Island {
         }
     }
 
+    fn clear_current_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.clear_draft {
+            self.attachment = None;
+            self.attachment_loading = false;
+            self.attachment_revision += 1;
+            self.body
+                .update(cx, |input, cx| input.set_value("", window, cx));
+            self.title
+                .update(cx, |input, cx| input.set_value("", window, cx));
+            self.clear_draft = false;
+        }
+    }
+
+    pub(crate) fn reader_target_changed(&mut self) {
+        if !drafts::Target::new(self.compose_target, self.compose_forum)
+            .can_send(self.selected, self.forum)
+        {
+            self.composing = false;
+            self.kaomoji_open = false;
+        }
+    }
+
     fn compose(
         &mut self,
         target: Option<u64>,
@@ -645,17 +684,31 @@ impl Island {
         if self.sending {
             return;
         }
-        // Never silently retarget an existing draft.
-        if (!self.body.read(cx).value().trim().is_empty()
-            || !self.title.read(cx).value().trim().is_empty()
-            || self.attachment.is_some()
-            || self.attachment_loading)
-            && (target != self.compose_target
-                || (target.is_none() && self.forum != self.compose_forum))
-        {
-            self.notice = "请先发送或清空当前草稿，再切换发帖目标".into();
-            cx.notify();
-            return;
+        self.clear_current_draft(window, cx);
+        let from = drafts::Target::new(self.compose_target, self.compose_forum);
+        let to = drafts::Target::new(target, self.forum);
+        if from != to {
+            // In-flight file/clipboard reads must never attach to the next draft.
+            self.attachment_revision += 1;
+            self.attachment_loading = false;
+            let current = ComposerDraft {
+                body: self.body.clone(),
+                title: self.title.clone(),
+                attachment: self.attachment.take(),
+            };
+            let next = self.drafts.switch(from, to, current, || ComposerDraft {
+                body: cx.new(|cx| {
+                    InputState::new(window, cx)
+                        .multi_line(true)
+                        .placeholder("在这里写下想说的话…")
+                }),
+                title: cx.new(|cx| InputState::new(window, cx).placeholder("标题（可选）")),
+                attachment: None,
+            });
+            self.body = next.body;
+            self.title = next.title;
+            self.attachment = next.attachment;
+            self.notice = "已切换到此目标的独立草稿；其他串的草稿已保留（本次运行内）".into();
         }
         self.compose_target = target;
         self.compose_forum = self.forum;
@@ -664,17 +717,30 @@ impl Island {
             .unwrap_or_else(|| format!("发串到 {}", self.forum_name));
         if let Some(id) = quote {
             let current = self.body.read(cx).value();
+            let suffix = drafts::quote_suffix(&current, id);
+            let end = current.encode_utf16().count();
             self.body.update(cx, |input, cx| {
-                input.set_value(format!("{current}\n>>No.{id}\n"), window, cx)
+                // Native insertion keeps undo history and puts the caret after
+                // the quote's trailing newline (set_value resets it to start).
+                input.replace_text_in_range(Some(end..end), &suffix, window, cx);
             });
         }
+        self.kaomoji_open = false;
         self.composing = true;
         self.animation += 1;
         self.body.update(cx, |input, cx| input.focus(window, cx));
         cx.notify();
     }
     fn send(&mut self, cx: &mut Context<Self>) {
-        if self.sending || !self.cookie || self.attachment_loading {
+        if self.sending || !self.cookie || self.attachment_loading || !self.composing {
+            return;
+        }
+        if self.clear_draft
+            || !drafts::Target::new(self.compose_target, self.compose_forum)
+                .can_send(self.selected, self.forum)
+        {
+            self.notice = "已阻止发送：草稿目标与当前浏览目标不一致，请在目标串重新点击回复".into();
+            cx.notify();
             return;
         }
         let body = self.body.read(cx).value().to_string();
@@ -1240,16 +1306,7 @@ impl Render for Island {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.install_preview_shortcuts(window, cx);
         let p = Palette::current(cx);
-        if self.clear_draft {
-            self.attachment = None;
-            self.attachment_loading = false;
-            self.attachment_revision += 1;
-            self.body
-                .update(cx, |input, cx| input.set_value("", window, cx));
-            self.title
-                .update(cx, |input, cx| input.set_value("", window, cx));
-            self.clear_draft = false;
-        }
+        self.clear_current_draft(window, cx);
         let mut forums = div()
             .id("forums-scroll")
             .flex_1()
@@ -1716,12 +1773,31 @@ impl Render for Island {
                             .h_full(),
                     ),
                 )
+                .when(self.kaomoji_open, |d| d.child(self.kaomoji_picker(cx)))
                 .child(
                     div()
                         .px_4()
                         .flex()
                         .flex_wrap()
                         .items_center()
+                        .child(
+                            button(
+                                p,
+                                "toggle-kaomoji",
+                                if self.kaomoji_open {
+                                    "收起颜文字"
+                                } else {
+                                    "颜文字"
+                                },
+                            )
+                            .when(self.sending, |d| d.opacity(0.4))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if !this.sending {
+                                    this.kaomoji_open = !this.kaomoji_open;
+                                    cx.notify();
+                                }
+                            })),
+                        )
                         .child(
                             button(
                                 p,
@@ -1795,11 +1871,14 @@ impl Render for Island {
                         .flex()
                         .p_4()
                         .justify_between()
+                        .flex_wrap()
+                        .gap_2()
                         .child(
                             button(p, "close-editor", "收起 / 保留草稿").on_click(cx.listener(
                                 |this, _, _, cx| {
                                     if !this.sending {
                                         this.composing = false;
+                                        this.kaomoji_open = false;
                                         cx.notify();
                                     }
                                 },
