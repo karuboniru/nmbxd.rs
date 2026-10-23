@@ -4,5 +4,6 @@ pub const USER_AGENT: &str = concat!("rdnmb/", env!("CARGO_PKG_VERSION"));
 
 pub mod api;
 pub mod content;
+pub mod history;
 pub mod model;
 pub mod tree;

@@ -1,6 +1,6 @@
 //! Wire models and plain text rendering for X 岛's mixed string/number API.
 use regex::Regex;
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::sync::OnceLock;
 
 fn integer<'de, D: Deserializer<'de>>(d: D) -> Result<i64, D::Error> {
@@ -91,7 +91,7 @@ impl Forum {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct Post {
     #[serde(deserialize_with = "unsigned")]
     pub id: u64,
