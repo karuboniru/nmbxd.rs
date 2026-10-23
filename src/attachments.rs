@@ -1,7 +1,7 @@
 //! Local attachment selection and bounded decoding. No uploads happen here.
 use gpui::{ClipboardEntry, ClipboardItem, Image, RenderImage, Window};
 use image::{DynamicImage, Frame, ImageDecoder, ImageEncoder, ImageReader, Limits};
-use nmbxd::api::{ImageAttachment, MAX_IMAGE_BYTES};
+use rdnmb::api::{ImageAttachment, MAX_IMAGE_BYTES};
 use std::{
     fs::File,
     future::Future,

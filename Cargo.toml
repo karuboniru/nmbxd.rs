@@ -1,8 +1,8 @@
 [package]
-name = "nmbxd"
-version = "0.1.5"
+name = "rdnmb"
+version = "0.1.6"
 edition = "2024"
-description = "X岛黎明版 — native X island reader"
+description = "R岛 (rdnmb) — native X island reader"
 license = "MIT"
 
 [dependencies]

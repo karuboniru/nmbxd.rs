@@ -4579,27 +4579,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "nmbxd"
-version = "0.1.5"
-dependencies = [
- "anyhow",
- "arboard",
- "ashpd 0.11.1",
- "dotenvy",
- "gpui",
- "gpui-component",
- "html-escape",
- "image",
- "raw-window-handle",
- "regex",
- "reqwest",
- "rfd",
- "serde",
- "serde_json",
- "uuid",
-]
-
-[[package]]
 name = "no_std_io2"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6051,6 +6030,27 @@ checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
 dependencies = [
  "crossbeam-deque",
  "crossbeam-utils",
+]
+
+[[package]]
+name = "rdnmb"
+version = "0.1.6"
+dependencies = [
+ "anyhow",
+ "arboard",
+ "ashpd 0.11.1",
+ "dotenvy",
+ "gpui",
+ "gpui-component",
+ "html-escape",
+ "image",
+ "raw-window-handle",
+ "regex",
+ "reqwest",
+ "rfd",
+ "serde",
+ "serde_json",
+ "uuid",
 ]
 
 [[package]]

@@ -4,7 +4,7 @@
 //! while each frame's text element only supplies layout and mouse hit testing.
 use crate::appearance::Palette;
 use gpui::{prelude::*, *};
-use nmbxd::content::{ContentLink, LinkTarget, ParsedContent};
+use rdnmb::content::{ContentLink, LinkTarget, ParsedContent};
 use std::{ops::Range, rc::Rc};
 
 type LinkCallback = Rc<dyn Fn(&LinkTarget, &mut Window, &mut App)>;

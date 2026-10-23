@@ -43,7 +43,7 @@ impl Default for Settings {
             cookie: String::new(),
             subscription_id: uuid::Uuid::new_v4().to_string(),
             font_family: DEFAULT_FONT.into(),
-            website_base: nmbxd::api::WEBSITE_BASE.into(),
+            website_base: rdnmb::api::WEBSITE_BASE.into(),
             ui_font_size: DEFAULT_UI_FONT_SIZE,
             thread_font_size: DEFAULT_FONT_SIZE,
             body_font_size: DEFAULT_FONT_SIZE,
@@ -53,56 +53,56 @@ impl Default for Settings {
 
 impl Settings {
     fn path() -> Option<PathBuf> {
-        std::env::var_os("XDG_CONFIG_HOME")
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-            .filter(|path| path.is_absolute())
-            .or_else(|| {
-                #[cfg(target_os = "windows")]
-                {
-                    std::env::var_os("APPDATA")
-                        .filter(|value| !value.is_empty())
-                        .map(PathBuf::from)
-                        .filter(|path| path.is_absolute())
-                }
-                #[cfg(not(target_os = "windows"))]
-                None
-            })
-            .or_else(|| {
-                std::env::var_os("HOME")
-                    .filter(|value| !value.is_empty())
-                    .map(|home| PathBuf::from(home).join(".config"))
-            })
-            .map(|base| base.join("nmbxd/settings.json"))
+        crate::config_paths::paths("settings.json").map(|(current, _)| current)
     }
 
     /// Persist a new subscription ID before the application can use it. Existing
     /// unreadable or malformed settings are reported without overwriting them.
     /// A saved empty cookie overrides the fallback for anonymous browsing.
     pub fn load_or_initialize(fallback_cookie: String) -> Result<Self> {
-        let path = Self::path().context("无法确定配置目录")?;
-        Self::load_or_initialize_from(&path, fallback_cookie)
+        let (path, legacy) =
+            crate::config_paths::paths("settings.json").context("无法确定配置目录")?;
+        Self::load_or_initialize_paths(&path, Some(&legacy), fallback_cookie)
     }
 
+    #[cfg(test)]
     fn load_or_initialize_from(path: &Path, fallback_cookie: String) -> Result<Self> {
-        let bytes = match fs::read(path) {
-            Ok(bytes) => bytes,
+        Self::load_or_initialize_paths(path, None, fallback_cookie)
+    }
+
+    fn load_or_initialize_paths(
+        path: &Path,
+        legacy: Option<&Path>,
+        fallback_cookie: String,
+    ) -> Result<Self> {
+        let (bytes, migrating) = match fs::read(path) {
+            Ok(bytes) => (Some(bytes), false),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let settings = Self {
-                    cookie: fallback_cookie,
-                    ..Self::default()
+                let bytes = match legacy.map(fs::read) {
+                    Some(Ok(bytes)) => Some(bytes),
+                    Some(Err(error)) if error.kind() != std::io::ErrorKind::NotFound => {
+                        return Err(error).context("无法读取旧设置文件");
+                    }
+                    _ => None,
                 };
-                settings.save_to(path)?;
-                return Ok(settings);
+                (bytes, true)
             }
             Err(error) => return Err(error).context("无法读取设置文件"),
+        };
+        let Some(bytes) = bytes else {
+            let settings = Self {
+                cookie: fallback_cookie,
+                ..Self::default()
+            };
+            settings.save_to(path)?;
+            return Ok(settings);
         };
         let stored: serde_json::Value =
             serde_json::from_slice(&bytes).context("无法解析设置文件")?;
         let needs_subscription_id = stored.get("subscription_id").is_none();
         let mut settings: Self = serde_json::from_value(stored).context("设置文件格式无效")?;
         settings.normalize_font_sizes();
-        if needs_subscription_id {
+        if migrating || needs_subscription_id {
             settings.save_to(path)?;
         }
         Ok(settings)
@@ -134,7 +134,7 @@ impl Settings {
 
     fn save_to(&self, path: &Path) -> Result<()> {
         static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
-        let subscription_id = nmbxd::api::validate_subscription_id(&self.subscription_id)?;
+        let subscription_id = rdnmb::api::validate_subscription_id(&self.subscription_id)?;
         let parent = path.parent().context("配置文件目录无效")?;
         fs::create_dir_all(parent).context("无法创建配置目录")?;
         // A new inode ensures an old, broadly readable file is never rewritten
@@ -468,7 +468,7 @@ impl Render for SettingsPanel {
                                 if this.saving {
                                     return;
                                 }
-                                let subscription_id = match nmbxd::api::validate_subscription_id(
+                                let subscription_id = match rdnmb::api::validate_subscription_id(
                                     this.subscription_id.read(cx).value().as_ref(),
                                 ) {
                                     Ok(id) => id.to_string(),
@@ -526,6 +526,108 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
+    fn rebrand_migration_preserves_credentials_preferences_and_legacy_file() {
+        let directory = std::env::temp_dir().join(format!(
+            "rdnmb-settings-rebrand-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let legacy = directory.join("nmbxd/settings.json");
+        let current = directory.join("rdnmb/settings.json");
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        for cookie in ["saved-cookie", ""] {
+            let original = Settings {
+                cookie: cookie.into(),
+                subscription_id: "existing-shared-subscription".into(),
+                font_family: "Custom Font".into(),
+                website_base: "https://island.example/".into(),
+                ui_font_size: 19.,
+                thread_font_size: 17.,
+                body_font_size: 21.,
+            };
+            original.save_to(&legacy).unwrap();
+            let bytes = fs::read(&legacy).unwrap();
+            let migrated = Settings::load_or_initialize_paths(
+                &current,
+                Some(&legacy),
+                "ignored-fallback".into(),
+            )
+            .unwrap();
+            assert_eq!(migrated.cookie, cookie);
+            assert_eq!(migrated.subscription_id, original.subscription_id);
+            assert_eq!(migrated.font_family, original.font_family);
+            assert_eq!(migrated.website_base, original.website_base);
+            assert_eq!(migrated.ui_font_size, 19.);
+            assert_eq!(migrated.thread_font_size, 17.);
+            assert_eq!(migrated.body_font_size, 21.);
+            assert_eq!(fs::read(&legacy).unwrap(), bytes);
+            assert_eq!(Settings::load_from(&current).unwrap().cookie, cookie);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    fs::metadata(&current).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+            }
+            fs::remove_file(&current).unwrap();
+        }
+        // Older settings without a subscription ID get one only in the new file.
+        let bytes = br#"{"cookie":"","font_family":"Old Font"}"#;
+        fs::write(&legacy, bytes).unwrap();
+        let migrated =
+            Settings::load_or_initialize_paths(&current, Some(&legacy), "ignored".into()).unwrap();
+        let reloaded =
+            Settings::load_or_initialize_paths(&current, Some(&legacy), "ignored".into()).unwrap();
+        assert_eq!(migrated.subscription_id, reloaded.subscription_id);
+        assert_eq!(fs::read(&legacy).unwrap(), bytes);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn rebrand_migration_respects_current_settings_and_reports_invalid_legacy() {
+        let directory = std::env::temp_dir().join(format!(
+            "rdnmb-settings-rebrand-errors-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let legacy = directory.join("nmbxd/settings.json");
+        let current = directory.join("rdnmb/settings.json");
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        for bytes in [
+            b"{invalid".as_slice(),
+            br#"{"cookie":null}"#.as_slice(),
+            br#"{"subscription_id":""}"#.as_slice(),
+        ] {
+            fs::write(&legacy, bytes).unwrap();
+            assert!(
+                Settings::load_or_initialize_paths(&current, Some(&legacy), "fallback".into())
+                    .is_err()
+            );
+            assert!(!current.exists());
+            assert_eq!(fs::read(&legacy).unwrap(), bytes);
+        }
+        let original = Settings {
+            cookie: "current-cookie".into(),
+            ..Settings::default()
+        };
+        original.save_to(&current).unwrap();
+        let current_bytes = fs::read(&current).unwrap();
+        let loaded =
+            Settings::load_or_initialize_paths(&current, Some(&legacy), "ignored".into()).unwrap();
+        assert_eq!(loaded.cookie, original.cookie);
+        assert_eq!(loaded.subscription_id, original.subscription_id);
+        assert_eq!(fs::read(&current).unwrap(), current_bytes);
+        assert_eq!(fs::read_dir(current.parent().unwrap()).unwrap().count(), 1);
+        // A broken current file is authoritative too: do not revert to old credentials.
+        fs::write(&current, b"{invalid-current").unwrap();
+        original.save_to(&legacy).unwrap();
+        assert!(
+            Settings::load_or_initialize_paths(&current, Some(&legacy), "ignored".into()).is_err()
+        );
+        assert_eq!(fs::read(&current).unwrap(), b"{invalid-current");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn default_subscription_ids_are_random_uuid_v4_values() {
         let first = Settings::default().subscription_id;
         let second = Settings::default().subscription_id;
@@ -537,7 +639,7 @@ mod tests {
     #[test]
     fn startup_initializes_and_migrates_subscription_ids_once() {
         let directory = std::env::temp_dir().join(format!(
-            "nmbxd-settings-startup-test-{}",
+            "rdnmb-settings-startup-test-{}",
             uuid::Uuid::new_v4()
         ));
         let path = directory.join("settings.json");
@@ -569,7 +671,7 @@ mod tests {
     #[test]
     fn startup_preserves_malformed_settings() {
         let directory = std::env::temp_dir().join(format!(
-            "nmbxd-settings-invalid-test-{}",
+            "rdnmb-settings-invalid-test-{}",
             uuid::Uuid::new_v4()
         ));
         fs::create_dir_all(&directory).unwrap();
@@ -588,7 +690,7 @@ mod tests {
     #[test]
     fn legacy_settings_default_website_and_custom_website_persists() {
         let directory = std::env::temp_dir().join(format!(
-            "nmbxd-settings-migration-test-{}-{}",
+            "rdnmb-settings-migration-test-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -630,7 +732,7 @@ mod tests {
     #[test]
     fn edited_subscription_id_is_validated_and_persists() {
         let directory = std::env::temp_dir().join(format!(
-            "nmbxd-settings-subscription-test-{}",
+            "rdnmb-settings-subscription-test-{}",
             uuid::Uuid::new_v4()
         ));
         let path = directory.join("settings.json");
@@ -640,7 +742,7 @@ mod tests {
         };
         assert!(settings.save_to(&path).is_err());
         assert!(!directory.exists());
-        settings.subscription_id = "岛".repeat(nmbxd::api::MAX_SUBSCRIPTION_ID_CHARS + 1);
+        settings.subscription_id = "岛".repeat(rdnmb::api::MAX_SUBSCRIPTION_ID_CHARS + 1);
         assert!(settings.save_to(&path).is_err());
         assert!(!directory.exists());
         settings.subscription_id = "  我的共享订阅 ID  ".into();
@@ -671,7 +773,7 @@ mod tests {
     #[test]
     fn persisted_font_sizes_are_clamped_and_nonfinite_values_save_as_defaults() {
         let directory = std::env::temp_dir().join(format!(
-            "nmbxd-settings-size-test-{}-{}",
+            "rdnmb-settings-size-test-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -703,7 +805,7 @@ mod tests {
     #[test]
     fn saved_empty_cookie_remains_distinct_from_missing_settings() {
         let directory = std::env::temp_dir().join(format!(
-            "nmbxd-settings-test-{}-{}",
+            "rdnmb-settings-test-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)

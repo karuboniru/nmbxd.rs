@@ -194,7 +194,7 @@ impl ApiClient {
         }
         let client = Client::builder()
             .default_headers(headers)
-            .user_agent("nmbxd-rs/0.1")
+            .user_agent(crate::USER_AGENT)
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(30))
             .redirect(reqwest::redirect::Policy::none())

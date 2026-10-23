@@ -6,17 +6,17 @@ Push-Location (Split-Path $PSScriptRoot -Parent)
 try {
     $target = 'x86_64-pc-windows-msvc'
     if (!$SkipBuild) {
-        cargo build --release --locked -p nmbxd --target $target
+        cargo build --release --locked -p rdnmb --target $target
         if ($LASTEXITCODE -ne 0) { throw 'Release build failed' }
     }
     $metadataJson = cargo metadata --no-deps --format-version 1 --locked
     if ($LASTEXITCODE -ne 0) { throw 'Could not read Cargo metadata' }
     $metadata = $metadataJson | ConvertFrom-Json
-    $package = $metadata.packages | Where-Object { $_.name -eq 'nmbxd' }
+    $package = $metadata.packages | Where-Object { $_.name -eq 'rdnmb' }
     $version = $package.version
     if ($version -notmatch '^[A-Za-z0-9._+-]+$') { throw 'Invalid package version' }
-    $name = "nmbxd-$version-windows-x86_64"
-    $binary = Join-Path $metadata.target_directory "$target/release/nmbxd.exe"
+    $name = "rdnmb-$version-windows-x86_64"
+    $binary = Join-Path $metadata.target_directory "$target/release/rdnmb.exe"
     if (!(Test-Path -LiteralPath $binary -PathType Leaf)) { throw "Missing executable: $binary" }
 
     New-Item -ItemType Directory -Force -Path dist | Out-Null
@@ -25,7 +25,7 @@ try {
     New-Item -ItemType Directory -Path "$bundle/licenses", "$bundle/docs" | Out-Null
     try {
         # Explicit allowlist: never copy credentials or the whole build tree.
-        Copy-Item -LiteralPath $binary -Destination "$bundle/nmbxd.exe"
+        Copy-Item -LiteralPath $binary -Destination "$bundle/rdnmb.exe"
         Copy-Item README.md, .env.example -Destination $bundle
         Copy-Item docs/dark-mode.png, docs/settings.png -Destination "$bundle/docs"
         Copy-Item assets/fonts/OFL.txt "$bundle/licenses/NotoColorEmoji-OFL.txt"

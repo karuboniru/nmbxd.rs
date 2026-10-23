@@ -1,7 +1,7 @@
 //! On-demand, nested reference previews. Frames own request generations so
 //! responses to closed previews can never reopen or replace a newer preview.
 use crate::*;
-use nmbxd::{
+use rdnmb::{
     api::ReferencePreview,
     content::{LinkTarget, parse_content},
 };

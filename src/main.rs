@@ -3,6 +3,7 @@
 mod appearance;
 mod assets;
 mod attachments;
+mod config_paths;
 mod drafts;
 mod emoji;
 mod image_actions;
@@ -28,7 +29,8 @@ use gpui_component::{
     menu::{ContextMenuExt, PopupMenuItem},
 };
 use navigation::{Navigation, PageAction, PageMode, parse_page};
-use nmbxd::{
+use rdnmb::{
+    APP_ID, APP_NAME,
     api::ApiClient,
     model::{ForumGroup, Post},
     tree::ThreadTree,
@@ -36,8 +38,6 @@ use nmbxd::{
 use scrolling::ScrollPaging;
 use settings::{Settings, SettingsEvent, SettingsPanel};
 use std::{collections::HashSet, sync::mpsc, time::Duration};
-
-const APP_NAME: &str = "X岛黎明版";
 
 enum Request {
     Feed(u64, String, u32),
@@ -53,12 +53,12 @@ enum Request {
         i64,
         String,
         String,
-        Option<nmbxd::api::ImageAttachment>,
+        Option<rdnmb::api::ImageAttachment>,
     ),
 }
 enum Response {
     FeedChanged(String, u64, bool, Result<String, String>),
-    Reference(u64, Result<nmbxd::api::ReferencePreview, String>),
+    Reference(u64, Result<rdnmb::api::ReferencePreview, String>),
     JumpProbe(u64, Result<Post, String>),
     Configured(Result<Settings, String>),
     Forums(Result<Vec<ForumGroup>, String>),
@@ -1413,7 +1413,7 @@ impl Render for Island {
             .flex()
             .flex_col()
             .bg(rgb(p.sidebar))
-            .child(heading(p, "N M B X D", APP_NAME.into()))
+            .child(heading(p, "R D N M B", APP_NAME.into()))
             .child(
                 button(p, "subscriptions", "☆ 我的订阅")
                     .mx_3()
@@ -2062,7 +2062,7 @@ impl Render for Island {
 
 fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
-    let cookie = ["NMBXD_COOKIE", "userhash", "usrhash"]
+    let cookie = ["RDNMB_COOKIE", "NMBXD_COOKIE", "userhash", "usrhash"]
         .iter()
         .find_map(|key| std::env::var(key).ok())
         .filter(|s| !s.trim().is_empty());
@@ -2107,7 +2107,7 @@ fn main() -> anyhow::Result<()> {
                         size(px(1400.), px(900.)),
                         cx,
                     ))),
-                    app_id: Some("io.github.nmbxd.Dawn".into()),
+                    app_id: Some(APP_ID.into()),
                     window_decorations: Some(WindowDecorations::Client),
                     window_background: WindowBackgroundAppearance::Transparent,
                     window_min_size: Some(size(px(1100.), px(640.))),

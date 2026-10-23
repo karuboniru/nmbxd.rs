@@ -1,4 +1,4 @@
-# X岛黎明版 · nmbxd
+# R岛 · rdnmb
 
 Rust / GPUI 原生 X 岛客户端。支持跟随系统 / 浅色 / 深色主题，使用客户端标题栏（CSD），提供拖动、双击最大化，以及最小化、最大化和关闭按钮。四栏布局：板块 → 串列表 → 阅读 → 发串 / 回复；拖动栏间分隔线可调整宽度，各栏保留最小宽度。打开串渐显，编辑栏展开动画。中文输入、选择和剪贴板由 gpui-component 输入组件提供。
 
@@ -17,7 +17,7 @@ toolbox run sudo dnf install -y gcc-c++ cmake clang pkgconf-pkg-config \
   vulkan-loader mesa-vulkan-drivers google-noto-sans-cjk-fonts
 ```
 
-未保存界面设置时，从项目目录启动会读取 `.env`。支持 `NMBXD_COOKIE`、`userhash` 或现有文件使用的 `usrhash`，值为原始百分号编码饼干；也支持 `userhash=…` 形式。无饼干可尝试只读浏览，具体可见板块由服务器决定。`.env` 已忽略，不要提交真实凭据。
+未保存界面设置时，从项目目录启动会读取 `.env`。优先使用 `RDNMB_COOKIE`，兼容旧变量 `NMBXD_COOKIE`、`userhash` 或现有文件使用的 `usrhash`，值为原始百分号编码饼干；也支持 `userhash=…` 形式。无饼干可尝试只读浏览，具体可见板块由服务器决定。`.env` 已忽略，不要提交真实凭据。
 
 ```sh
 toolbox run cargo test --locked
@@ -26,13 +26,13 @@ toolbox run cargo run --locked -- --smoke
 
 `--smoke` 只读请求板块列表、综合一首页和其中一串第一页；不输出凭据或帖子内容，不发送帖子。
 
-主题按钮循环切换跟随系统、浅色和深色，选择保存到 `$XDG_CONFIG_HOME/nmbxd/appearance.json`（默认 `~/.config/nmbxd/appearance.json`），首次启动跟随系统。
+主题按钮循环切换跟随系统、浅色和深色，选择保存到 `$XDG_CONFIG_HOME/rdnmb/appearance.json`（默认 `~/.config/rdnmb/appearance.json`），首次启动跟随系统。
 
 ## 设置
 
 标题栏“设置”可修改 cookie、订阅 ID、网页地址、界面字体，以及 UI / 串列表 / 正文三个独立字号（默认 16 / 14 / 14 px；编辑框正文跟随正文字号）。保存后即时生效，重启后保留。网页地址默认 `https://www.nmbxd1.com/`，也可输入 `www.nmbxd1.com`；只接受 HTTPS 站点根地址，用于发串 / 回复，JSON 浏览 API 的地址独立。旧设置会自动采用新默认值。cookie 默认隐藏，可临时显示；清空并保存后以游客身份请求，不会重新采用 `.env` 中的旧 cookie。字体下拉框列出系统安装的字体，支持搜索和预览；保存后应用到整个界面，包括编辑器，切换主题仍保留字体选择。
 
-设置保存在 `$XDG_CONFIG_HOME/nmbxd/settings.json`（默认 `~/.config/nmbxd/settings.json`），优先于启动环境和 `.env`。Linux 文件权限为 `0600`，使用临时文件原子替换。cookie 是本地明文保存，不是密钥环存储；分发包绝不包含该文件。保存先检查 cookie 格式，再替换网络客户端；服务器是否接受该饼干以实际请求为准。不会通过发帖验证饼干。
+设置保存在 `$XDG_CONFIG_HOME/rdnmb/settings.json`（默认 `~/.config/rdnmb/settings.json`），优先于启动环境和 `.env`。启动时会自动将旧 `nmbxd/settings.json` 复制到新目录，保留 cookie、订阅 ID、字体和字号；新目录没有 `appearance.json` 时先读取旧目录中的主题，下次保存主题时写入新目录。已有新目录文件时优先使用新文件，旧文件仍保留。Linux 文件权限为 `0600`，使用临时文件原子替换。cookie 是本地明文保存，不是密钥环存储；分发包绝不包含该文件。保存先检查 cookie 格式，再替换网络客户端；服务器是否接受该饼干以实际请求为准。不会通过发帖验证饼干。
 
 ## 阅读与引用树
 
@@ -87,33 +87,35 @@ toolbox run scripts/package-linux.sh
 scripts/package-linux.sh --skip-build
 ```
 
-输出位于 `dist/nmbxd-版本-linux-架构/`，以及同名 `.tar.gz` 和 `.tar.gz.sha256`。压缩包只包含程序、图标、桌面入口、说明、安装 / 卸载脚本、空白凭据示例和构建环境记录，不包含真实 `.env`、帖子数据或整个 `target`。`SOURCE_DATE_EPOCH` 可指定归档时间，默认使用最近一次提交时间；归档文件顺序和元数据固定。二进制本身的可重现性仍取决于工具链和系统库。
+输出位于 `dist/rdnmb-版本-linux-架构/`，以及同名 `.tar.gz` 和 `.tar.gz.sha256`。压缩包只包含程序、图标、桌面入口、说明、安装 / 卸载脚本、空白凭据示例和构建环境记录，不包含真实 `.env`、帖子数据或整个 `target`。`SOURCE_DATE_EPOCH` 可指定归档时间，默认使用最近一次提交时间；归档文件顺序和元数据固定。二进制本身的可重现性仍取决于工具链和系统库。
 
-解压后可直接运行 `./nmbxd`，或在解压目录执行 `./install.sh`，安装到当前用户的 `~/.local/bin` 及应用菜单。无需 sudo。执行 `./uninstall.sh` 删除这些安装文件；不会删除用户凭据。通过菜单启动后可以直接在标题栏的“设置”中填写饼干；从终端启动时也可以使用环境变量或当前目录的 `.env`。
+解压后可直接运行 `./rdnmb`，或在解压目录执行 `./install.sh`，安装到当前用户的 `~/.local/bin` 及应用菜单。无需 sudo。应用 ID 为 `org.niconi.rdnmb`，桌面文件名为 `org.niconi.rdnmb.desktop`。从旧版升级时，请先在旧发行包目录运行旧版 `./uninstall.sh`，再安装新版；新版安装器保留旧 `nmbxd` 程序、桌面入口和图标，不会自动删除它们。执行新版 `./uninstall.sh` 删除这些安装文件；不会删除用户凭据。通过菜单启动后可以直接在标题栏的“设置”中填写饼干；从终端启动时也可以使用环境变量或当前目录的 `.env`。
 
 ```sh
-sha256sum -c nmbxd-版本-linux-架构.tar.gz.sha256
-tar -xzf nmbxd-版本-linux-架构.tar.gz
-cd nmbxd-版本-linux-架构
-./nmbxd
+sha256sum -c rdnmb-版本-linux-架构.tar.gz.sha256
+tar -xzf rdnmb-版本-linux-架构.tar.gz
+cd rdnmb-版本-linux-架构
+./rdnmb
 ```
 
-这是针对构建机器架构的动态链接 Linux 程序，尚未提供 AppImage、Flatpak 或跨发行版静态包。构建环境写入 `BUILD-OS.txt`，实际 `ldd` 输出写入 `DEPENDENCIES.txt`；打包遇到缺失库会失败。较新 Fedora 编译的程序可能要求较新的 glibc，不能保证在较旧 Ubuntu / Debian 等发行版运行。分发前应在目标发行版运行 `ldd ./nmbxd` 检查 `not found` / GLIBC 版本错误，并验证桌面启动。运行需要可用的 Wayland / X11 图形会话、图形驱动及中文字体。
+这是针对构建机器架构的动态链接 Linux 程序，尚未提供 AppImage、Flatpak 或跨发行版静态包。构建环境写入 `BUILD-OS.txt`，实际 `ldd` 输出写入 `DEPENDENCIES.txt`；打包遇到缺失库会失败。较新 Fedora 编译的程序可能要求较新的 glibc，不能保证在较旧 Ubuntu / Debian 等发行版运行。分发前应在目标发行版运行 `ldd ./rdnmb` 检查 `not found` / GLIBC 版本错误，并验证桌面启动。运行需要可用的 Wayland / X11 图形会话、图形驱动及中文字体。
 
 ## Windows 测试包
 
-Windows CI 使用 `x86_64-pc-windows-msvc`，生成 `nmbxd-版本-windows-x86_64.zip` 和对应 `.zip.sha256`，随 tag 的 Linux 包一起发布。解压整个 ZIP 后运行其中的 `nmbxd.exe`；包内附带说明和许可证。当前保留控制台窗口，方便虚拟机测试时查看启动错误。
+Windows CI 使用 `x86_64-pc-windows-msvc`，生成 `rdnmb-版本-windows-x86_64.zip` 和对应 `.zip.sha256`，随 tag 的 Linux 包一起发布。解压整个 ZIP 后运行其中的 `rdnmb.exe`；包内附带说明和许可证。release 版本使用 Windows GUI 子系统，启动时不保留控制台窗口。
 
-在 Windows PowerShell 中可用 `Get-FileHash .\nmbxd-版本-windows-x86_64.zip -Algorithm SHA256` 核对校验文件。本机构建和打包可运行 `./scripts/package-windows.ps1`，已有对应 target 的 release 构建时加 `-SkipBuild`。构建需 Rust MSVC 工具链、Visual Studio C++ Build Tools 和 Windows SDK；GPUI 的 release 着色器编译需要 `fxc.exe`，可通过 `GPUI_FXC_PATH` 指定完整路径，CI 会自动查找。
+在 Windows PowerShell 中可用 `Get-FileHash .\rdnmb-版本-windows-x86_64.zip -Algorithm SHA256` 核对校验文件。本机构建和打包可运行 `./scripts/package-windows.ps1`，已有对应 target 的 release 构建时加 `-SkipBuild`。构建需 Rust MSVC 工具链、Visual Studio C++ Build Tools 和 Windows SDK；GPUI 的 release 着色器编译需要 `fxc.exe`，可通过 `GPUI_FXC_PATH` 指定完整路径，CI 会自动查找。
 
-Windows 配置默认保存在 `%APPDATA%\nmbxd\settings.json` 和 `appearance.json`，也支持以绝对路径的 `XDG_CONFIG_HOME` 覆盖。虚拟机中的窗口渲染、中文输入、图片剪贴板和文件选择仍待实机验证；CI 仅构建及运行单元测试，不启动 GUI。
+Windows 配置默认保存在 `%APPDATA%\rdnmb\settings.json` 和 `appearance.json`，也支持以绝对路径的 `XDG_CONFIG_HOME` 覆盖。虚拟机中的窗口渲染、中文输入、图片剪贴板和文件选择仍待实机验证；CI 仅构建及运行单元测试，不启动 GUI。
 
 ## 验证记录
 
 已在 Fedora 45 toolbox 完成 release 构建、83 项应用单元测试，另有 8 项 cosmic-text 测试、2 项窗口边缘回归测试和 `cargo clippy --all-targets -- -D warnings`。已检查 GNOME 下的 CSD 窗口和 Wayland 启动，以及夜间主题、系统字体下拉搜索、字体切换保存和设置文件 `0600` 权限。已在隔离 X11 / CSD 会话检查分隔线拖动、图片缩略图与原图、emoji 组合、Ctrl+V 图片草稿预览、自动翻页、末页刷新，以及最大化后关闭原图。Linux FileChooser portal 服务版本检查通过；尚未完成跨平台原生文件选择器实机测试。只读 API smoke 验证板块、串列表、回复页；未发送测试帖子。中文 IME 的实际输入仍需在桌面输入法环境中确认。
 
-![GNOME 中的夜间模式和客户端标题栏](docs/dark-mode.png)
-![饼干与字体设置](docs/settings.png)
+以下截图来自更名前的旧版，展示夜间模式、客户端标题栏及设置界面。
+
+![旧版：GNOME 中的夜间模式和客户端标题栏](docs/dark-mode.png)
+![旧版：饼干与字体设置](docs/settings.png)
 
 ### 引用预览与外部链接
 
@@ -139,9 +141,9 @@ HTTP(S) 外链通过系统默认浏览器打开，保留 HTML 链接的目标地
 [构建记录与下载](https://github.com/karuboniru/nmbxd.rs/actions/workflows/build.yml) · [正式发布](https://github.com/karuboniru/nmbxd.rs/releases)
 
 - 每次向任意分支 push、推送 tag，以及 PR 更新，自动在 **Ubuntu 24.04 x86_64** 和 **Windows Server 2022 x86_64（MSVC）** 上运行单元测试、构建 release 并打包。也可在 Actions 页面手动运行。一次 push 多个提交时构建该 push 的最终提交；不取消旧构建。
-- 成功后，在该次运行页面的 **Artifacts** 下载 `nmbxd-linux-x86_64-提交SHA`，内含 `.tar.gz` 和 `.sha256`；Windows 下载 `nmbxd-windows-x86_64-提交SHA`，内含 Windows ZIP 包和 `.sha256`。两者保留 30 天。GitHub 的 artifact 下载外层是 ZIP，解开后再解压里面的 tar 包并运行安装脚本。
+- 成功后，在该次运行页面的 **Artifacts** 下载 `rdnmb-linux-x86_64-提交SHA`，内含 `.tar.gz` 和 `.sha256`；Windows 下载 `rdnmb-windows-x86_64-提交SHA`，内含 Windows ZIP 包和 `.sha256`。两者保留 30 天。GitHub 的 artifact 下载外层是 ZIP，解开后再解压里面的 tar 包并运行安装脚本。
 - 推送任意 tag 时，等待两个平台构建成功后，两份已测试产物自动上传到该 tag 的 **GitHub Release**，不必从 Actions 下载。不会自动创建 tag；手动运行 tag 工作流不会额外发布 Release。重跑 tag 构建会更新该 Release 的同名附件。
-- 推荐先更新 `Cargo.toml` / `Cargo.lock` 版本并提交，再执行 `git tag v0.1.4 && git push origin v0.1.4`（版本号按实际填写）。压缩包名使用 Cargo 版本，Release 名使用 tag。
+- 推荐先更新 `Cargo.toml` / `Cargo.lock` 版本并提交，再执行 `git tag v0.1.6 && git push origin v0.1.6`（版本号按实际填写）。压缩包名使用 Cargo 版本，Release 名使用 tag。
 - 构建只使用仓库源码，不需要配置 cookie 或任何自定义 secret；仅发布 job 使用 GitHub 自动提供的 `GITHUB_TOKEN` 写入 Release。PR job 没有仓库写权限。
 - Ubuntu 产物仍是动态链接程序，不是通用静态包；运行目标需有兼容的 glibc / 系统库。包内 `BUILD-OS.txt` 与 `DEPENDENCIES.txt` 可用于检查。不在 CI 中启动 GUI，也不向岛上发送内容。
 
@@ -167,3 +169,7 @@ HTTP(S) 外链通过系统默认浏览器打开，保留 HTML 链接的目标地
 回复草稿按主串号分别保留，新串草稿按板块保留（仅当前运行，不写磁盘）。切到其他串会收起旧目标编辑器；点击新目标的“回复”会打开对应草稿，文字、标题、图片与撤销历史不会从旧串带入。未完成的图片读取在切换草稿时作废，避免图片加入错误目标。编辑器标题显示回复串号，发送前再次校验当前目标；清空或发送成功只清理当前草稿。
 
 引用回复在空草稿中直接写入 `>>No.串号`，光标落在下一行；已有正文时只补必要的分隔换行，并保留撤销历史。正文显示将 `<br>` 后用于 HTML 格式的单个源码换行视为同一次换行，不再重复生成空行；连续 `<br>` 表示的主动空行仍保留。
+
+### R岛更名（v0.1.6）
+
+客户端名称改为 **R岛**，包名改为 `rdnmb`，可执行文件和进程名在 Linux 为 `rdnmb`、Windows 为 `rdnmb.exe`，应用 ID 改为 `org.niconi.rdnmb`。新版配置使用 `rdnmb` 目录：自动复制旧设置，旧主题在读取后于下次保存时写入新目录；已有新文件时优先使用新文件。环境变量推荐 `RDNMB_COOKIE`，继续兼容 `NMBXD_COOKIE`。岛站域名和本项目 GitHub 仓库地址保持原样。

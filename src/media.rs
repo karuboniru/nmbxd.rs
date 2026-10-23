@@ -186,7 +186,7 @@ fn image_client() -> Result<&'static Client, String> {
     CLIENT
         .get_or_init(|| {
             Client::builder()
-                .user_agent("nmbxd-rs/0.1")
+                .user_agent(rdnmb::USER_AGENT)
                 .https_only(true)
                 .connect_timeout(Duration::from_secs(8))
                 .timeout(Duration::from_secs(20))

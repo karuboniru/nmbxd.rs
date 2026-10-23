@@ -8,7 +8,7 @@ impl Island {
         html: &str,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let text = nmbxd::content::parse_content(html).text;
+        let text = rdnmb::content::parse_content(html).text;
         button(Palette::current(cx), id, "复制正文")
             .on_click(cx.listener(move |this, _, _, cx| {
                 cx.stop_propagation();

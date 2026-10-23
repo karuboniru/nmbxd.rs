@@ -1,3 +1,7 @@
+pub const APP_NAME: &str = "R岛";
+pub const APP_ID: &str = "org.niconi.rdnmb";
+pub const USER_AGENT: &str = concat!("rdnmb/", env!("CARGO_PKG_VERSION"));
+
 pub mod api;
 pub mod content;
 pub mod model;

@@ -1,7 +1,7 @@
 //! Explicit page navigation over a contiguous, user-loaded subset of a thread.
 use std::collections::{BTreeMap, BTreeSet};
 
-use nmbxd::{model::Post, tree::ThreadTree};
+use rdnmb::{model::Post, tree::ThreadTree};
 
 // Xdcmd's Thread.maxPage uses ceil(replyCount / 19), excluding the service Tips.
 // https://github.com/TransparentLC/xdcmd/blob/master/xdnmb/model.py

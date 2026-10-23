@@ -2,7 +2,7 @@
 use gpui::{App, Window};
 use gpui_component::{Theme, ThemeMode};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::Path;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -28,33 +28,26 @@ impl Appearance {
             Self::Dark => "外观：夜间",
         }
     }
-    fn path() -> Option<PathBuf> {
-        std::env::var_os("XDG_CONFIG_HOME")
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-            .filter(|path| path.is_absolute())
-            .or_else(|| {
-                #[cfg(target_os = "windows")]
-                {
-                    std::env::var_os("APPDATA")
-                        .filter(|value| !value.is_empty())
-                        .map(PathBuf::from)
-                        .filter(|path| path.is_absolute())
-                }
-                #[cfg(not(target_os = "windows"))]
-                None
-            })
-            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-            .map(|base| base.join("nmbxd/appearance.json"))
-    }
     pub fn load() -> Self {
-        Self::path()
-            .and_then(|path| std::fs::read(path).ok())
+        crate::config_paths::paths("appearance.json")
+            .map(|(path, legacy)| Self::load_from_paths(&path, &legacy))
+            .unwrap_or_default()
+    }
+    fn load_from_paths(path: &Path, legacy: &Path) -> Self {
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::read(legacy).ok()
+            }
+            Err(_) => None,
+        };
+        bytes
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .unwrap_or_default()
     }
     pub fn save(self) -> anyhow::Result<()> {
-        let path = Self::path().ok_or_else(|| anyhow::anyhow!("无法确定配置目录"))?;
+        let (path, _) = crate::config_paths::paths("appearance.json")
+            .ok_or_else(|| anyhow::anyhow!("无法确定配置目录"))?;
         std::fs::create_dir_all(path.parent().unwrap())?;
         let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
         std::fs::write(&temporary, serde_json::to_vec(&self)?)?;
@@ -117,6 +110,39 @@ impl Palette {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn rebrand_falls_back_to_legacy_only_when_current_file_is_missing() {
+        let directory = std::env::temp_dir().join(format!(
+            "rdnmb-appearance-rebrand-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let legacy = directory.join("nmbxd/appearance.json");
+        let current = directory.join("rdnmb/appearance.json");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        assert_eq!(
+            Appearance::load_from_paths(&current, &legacy),
+            Appearance::System
+        );
+        std::fs::write(&legacy, br#""dark""#).unwrap();
+        assert_eq!(
+            Appearance::load_from_paths(&current, &legacy),
+            Appearance::Dark
+        );
+        std::fs::create_dir_all(current.parent().unwrap()).unwrap();
+        std::fs::write(&current, br#""light""#).unwrap();
+        assert_eq!(
+            Appearance::load_from_paths(&current, &legacy),
+            Appearance::Light
+        );
+        std::fs::write(&current, b"{invalid").unwrap();
+        assert_eq!(
+            Appearance::load_from_paths(&current, &legacy),
+            Appearance::System
+        );
+        assert_eq!(std::fs::read(&legacy).unwrap(), br#""dark""#);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn preference_round_trips_and_cycles_to_system() {
         for mode in [Appearance::System, Appearance::Light, Appearance::Dark] {

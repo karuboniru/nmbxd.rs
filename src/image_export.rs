@@ -202,7 +202,7 @@ mod tests {
         assert_eq!(result.filename, "animation.gif");
         let decoded = image::load_from_memory(result.clipboard.bytes()).unwrap();
         assert_eq!(decoded.into_rgba8().get_pixel(0, 0).0, [250, 20, 40, 255]);
-        let path = std::env::temp_dir().join(format!("nmbxd-export-{}", uuid::Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!("rdnmb-export-{}", uuid::Uuid::new_v4()));
         save(path.clone(), result.bytes).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
         std::fs::remove_file(path).unwrap();
@@ -210,7 +210,7 @@ mod tests {
 
     #[test]
     fn saves_original_bytes_without_overwriting_existing_file() {
-        let path = std::env::temp_dir().join(format!("nmbxd-export-{}", uuid::Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!("rdnmb-export-{}", uuid::Uuid::new_v4()));
         let bytes = source_image();
         save(path.clone(), bytes.clone()).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
@@ -222,7 +222,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn refuses_dangling_symlink_destinations() {
-        let path = std::env::temp_dir().join(format!("nmbxd-export-{}", uuid::Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!("rdnmb-export-{}", uuid::Uuid::new_v4()));
         let target = path.with_extension("target");
         std::os::unix::fs::symlink(&target, &path).unwrap();
         assert!(save(path.clone(), b"image".to_vec()).is_err());
