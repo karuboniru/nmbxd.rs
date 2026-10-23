@@ -127,6 +127,9 @@ struct Island {
     reading_revision: u64,
     reading_scroll: ScrollHandle,
     reading_paging: ScrollPaging,
+    thread_end_checked: bool,
+    cached_short_check: bool,
+    cached_check_scheduled: bool,
     reading_reset_pending: bool,
     reading_retry: Option<(u32, PageMode)>,
     panes: panes::PaneLayout,
@@ -361,6 +364,9 @@ impl Island {
             reading_revision: 0,
             reading_scroll: ScrollHandle::new(),
             reading_paging: ScrollPaging::default(),
+            thread_end_checked: false,
+            cached_short_check: false,
+            cached_check_scheduled: false,
             reading_reset_pending: false,
             reading_retry: None,
             panes,
@@ -673,11 +679,15 @@ impl Island {
             this.schedule_position_save(cx);
             let at_bottom =
                 this.reading_scroll.offset().y + this.reading_scroll.max_offset().height <= px(2.);
-            if !this.navigation.loading()
-                && this.reading_paging.on_scroll(at_bottom, downward)
-                && let Some((page, mode)) = this.reading_next()
-            {
-                this.request_page(page, mode, cx);
+            if !this.navigation.loading() {
+                let load_next = this.reading_paging.on_scroll(at_bottom, downward);
+                if let Some((page, mode)) = this.reading_next() {
+                    if load_next {
+                        this.request_page(page, mode, cx);
+                    }
+                } else if at_bottom && downward {
+                    this.check_thread_end_once(cx);
+                }
             }
             cx.notify();
         });
@@ -1420,6 +1430,7 @@ impl Render for Island {
         let p = Palette::current(cx);
         self.clear_current_draft(window, cx);
         self.schedule_reading_restore(window, cx);
+        self.schedule_cached_short_check(window, cx);
         let mut forums = div()
             .id("forums-scroll")
             .flex_1()

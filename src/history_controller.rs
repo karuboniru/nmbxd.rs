@@ -106,6 +106,9 @@ impl Island {
             .history
             .as_ref()
             .and_then(|store| store.last_visit(id).ok().flatten());
+        self.thread_end_checked = false;
+        self.cached_short_check = false;
+        self.cached_check_scheduled = false;
         self.selected = Some(id);
         self.reader_target_changed();
         self.tree = None;
@@ -150,6 +153,7 @@ impl Island {
         }
         cached.sort_by_key(|(page, _)| *page);
         if self.navigation.restore(cached, page) {
+            self.cached_short_check = true;
             self.tree = self.navigation.tree();
             self.notice = format!("已从本地缓存恢复第 {page} 页 · 可清除本串缓存后重载");
             self.record_current_visit();
@@ -177,6 +181,7 @@ impl Island {
                 };
                 let snapshot = post.clone();
                 if self.navigation.receive(page, Some(post)) {
+                    self.cached_short_check |= cached;
                     self.tree = self.navigation.tree();
                     if self.reading_reset_pending {
                         self.reading_restore = None;
@@ -254,6 +259,62 @@ impl Island {
         });
     }
 
+    /// Recheck the loaded trailing page once during this visit to the thread.
+    /// Mark before sending: a failure or a short response must not start a loop.
+    pub(crate) fn check_thread_end_once(&mut self, cx: &mut Context<Self>) {
+        if self.navigation.loading() || self.reading_paging.failed || self.showing_history {
+            return;
+        }
+        let (Some(_), Some((_, last))) = (self.selected, self.navigation.range()) else {
+            return;
+        };
+        if !self.thread_end_checked {
+            self.thread_end_checked = true;
+            self.request_page(last, PageMode::Recheck, cx);
+        }
+    }
+
+    pub(crate) fn schedule_cached_short_check(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.cached_short_check
+            || self.cached_check_scheduled
+            || self.showing_history
+            || self.navigation.loading()
+            || self.reading_restore.is_some()
+            || self.tree.is_none()
+        {
+            return;
+        }
+        self.cached_check_scheduled = true;
+        let epoch = self.thread_epoch;
+        let revision = self.reading_revision;
+        // Scroll bounds are valid only after the cached content has been laid out.
+        cx.on_next_frame(window, move |this, _, cx| {
+            if this.thread_epoch != epoch {
+                return;
+            }
+            this.cached_check_scheduled = false;
+            if this.reading_revision != revision
+                || this.showing_history
+                || this.navigation.loading()
+                || this.reading_restore.is_some()
+            {
+                cx.notify();
+                return;
+            }
+            if this.reading_scroll.bounds().size.height <= px(0.) {
+                return;
+            }
+            this.cached_short_check = false;
+            if this.reading_scroll.max_offset().height <= px(2.) {
+                this.check_thread_end_once(cx);
+            }
+        });
+    }
+
     pub(crate) fn clear_thread_cache(&mut self, cx: &mut Context<Self>) {
         let Some(id) = self.selected else {
             return;
@@ -271,6 +332,8 @@ impl Island {
                 }
             }
         }
+        self.cached_short_check = false;
+        self.cached_check_scheduled = false;
         // Invalidates in-flight old responses before they can repopulate cache.
         self.thread_epoch = self.thread_epoch.wrapping_add(1);
         self.navigation = Navigation::default();
