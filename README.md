@@ -100,6 +100,14 @@ cd nmbxd-版本-linux-架构
 
 这是针对构建机器架构的动态链接 Linux 程序，尚未提供 AppImage、Flatpak 或跨发行版静态包。构建环境写入 `BUILD-OS.txt`，实际 `ldd` 输出写入 `DEPENDENCIES.txt`；打包遇到缺失库会失败。较新 Fedora 编译的程序可能要求较新的 glibc，不能保证在较旧 Ubuntu / Debian 等发行版运行。分发前应在目标发行版运行 `ldd ./nmbxd` 检查 `not found` / GLIBC 版本错误，并验证桌面启动。运行需要可用的 Wayland / X11 图形会话、图形驱动及中文字体。
 
+## Windows 测试包
+
+Windows CI 使用 `x86_64-pc-windows-msvc`，生成 `nmbxd-版本-windows-x86_64.zip` 和对应 `.zip.sha256`，随 tag 的 Linux 包一起发布。解压整个 ZIP 后运行其中的 `nmbxd.exe`；包内附带说明和许可证。当前保留控制台窗口，方便虚拟机测试时查看启动错误。
+
+在 Windows PowerShell 中可用 `Get-FileHash .\nmbxd-版本-windows-x86_64.zip -Algorithm SHA256` 核对校验文件。本机构建和打包可运行 `./scripts/package-windows.ps1`，已有对应 target 的 release 构建时加 `-SkipBuild`。构建需 Rust MSVC 工具链、Visual Studio C++ Build Tools 和 Windows SDK；GPUI 的 release 着色器编译需要 `fxc.exe`，可通过 `GPUI_FXC_PATH` 指定完整路径，CI 会自动查找。
+
+Windows 配置默认保存在 `%APPDATA%\nmbxd\settings.json` 和 `appearance.json`，也支持以绝对路径的 `XDG_CONFIG_HOME` 覆盖。虚拟机中的窗口渲染、中文输入、图片剪贴板和文件选择仍待实机验证；CI 仅构建及运行单元测试，不启动 GUI。
+
 ## 验证记录
 
 已在 Fedora 45 toolbox 完成 release 构建、83 项应用单元测试，另有 8 项 cosmic-text 测试、2 项窗口边缘回归测试和 `cargo clippy --all-targets -- -D warnings`。已检查 GNOME 下的 CSD 窗口和 Wayland 启动，以及夜间主题、系统字体下拉搜索、字体切换保存和设置文件 `0600` 权限。已在隔离 X11 / CSD 会话检查分隔线拖动、图片缩略图与原图、emoji 组合、Ctrl+V 图片草稿预览、自动翻页、末页刷新，以及最大化后关闭原图。Linux FileChooser portal 服务版本检查通过；尚未完成跨平台原生文件选择器实机测试。只读 API smoke 验证板块、串列表、回复页；未发送测试帖子。中文 IME 的实际输入仍需在桌面输入法环境中确认。
@@ -130,9 +138,9 @@ HTTP(S) 外链通过系统默认浏览器打开，保留 HTML 链接的目标地
 
 [构建记录与下载](https://github.com/karuboniru/nmbxd.rs/actions/workflows/build.yml) · [正式发布](https://github.com/karuboniru/nmbxd.rs/releases)
 
-- 每次向任意分支 push、推送 tag，以及 PR 更新，自动在 **Ubuntu 24.04 x86_64** 上运行单元测试、构建 release 并打包。也可在 Actions 页面手动运行。一次 push 多个提交时构建该 push 的最终提交；不取消旧构建。
-- 成功后，在该次运行页面的 **Artifacts** 下载 `nmbxd-linux-x86_64-提交SHA`，内含 `.tar.gz` 和 `.sha256`；保留 30 天。GitHub 的 artifact 下载外层是 ZIP，解开后再解压里面的 tar 包并运行安装脚本。
-- 推送任意 tag 时，同一份已测试产物自动上传到该 tag 的 **GitHub Release**，不必从 Actions 下载。不会自动创建 tag；手动运行 tag 工作流不会额外发布 Release。重跑 tag 构建会更新该 Release 的同名附件。
+- 每次向任意分支 push、推送 tag，以及 PR 更新，自动在 **Ubuntu 24.04 x86_64** 和 **Windows Server 2022 x86_64（MSVC）** 上运行单元测试、构建 release 并打包。也可在 Actions 页面手动运行。一次 push 多个提交时构建该 push 的最终提交；不取消旧构建。
+- 成功后，在该次运行页面的 **Artifacts** 下载 `nmbxd-linux-x86_64-提交SHA`，内含 `.tar.gz` 和 `.sha256`；Windows 下载 `nmbxd-windows-x86_64-提交SHA`，内含 Windows ZIP 包和 `.sha256`。两者保留 30 天。GitHub 的 artifact 下载外层是 ZIP，解开后再解压里面的 tar 包并运行安装脚本。
+- 推送任意 tag 时，等待两个平台构建成功后，两份已测试产物自动上传到该 tag 的 **GitHub Release**，不必从 Actions 下载。不会自动创建 tag；手动运行 tag 工作流不会额外发布 Release。重跑 tag 构建会更新该 Release 的同名附件。
 - 推荐先更新 `Cargo.toml` / `Cargo.lock` 版本并提交，再执行 `git tag v0.1.4 && git push origin v0.1.4`（版本号按实际填写）。压缩包名使用 Cargo 版本，Release 名使用 tag。
 - 构建只使用仓库源码，不需要配置 cookie 或任何自定义 secret；仅发布 job 使用 GitHub 自动提供的 `GITHUB_TOKEN` 写入 Release。PR job 没有仓库写权限。
 - Ubuntu 产物仍是动态链接程序，不是通用静态包；运行目标需有兼容的 glibc / 系统库。包内 `BUILD-OS.txt` 与 `DEPENDENCIES.txt` 可用于检查。不在 CI 中启动 GUI，也不向岛上发送内容。

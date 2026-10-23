@@ -82,9 +82,80 @@ jobs:
           compression-level: 0
           retention-days: 30
 
+  build-windows:
+    name: Windows x86_64 (MSVC)
+    runs-on: windows-2022
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CARGO_BUILD_TARGET: x86_64-pc-windows-msvc
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Locate Windows shader compiler
+        run: |
+          # GPUI 0.2.2 otherwise falls back to one hard-coded SDK version.
+          $fxc = Get-ChildItem "${env:ProgramFiles(x86)}/Windows Kits/10/bin/*/x64/fxc.exe" |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (!$fxc) { throw 'Windows SDK fxc.exe was not found' }
+          "GPUI_FXC_PATH=$($fxc.FullName)" >> $env:GITHUB_ENV
+
+      - name: Install Rust stable
+        id: rust
+        run: |
+          rustup toolchain install stable --profile minimal --target $env:CARGO_BUILD_TARGET
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup default stable
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $version = rustc --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Output $version
+          cargo --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target/release
+            target/x86_64-pc-windows-msvc/release
+          key: windows-x86_64-msvc-2022-rust-${{ steps.rust.outputs.version }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'vendor/**/Cargo.toml') }}-${{ github.sha }}
+          restore-keys: |
+            windows-x86_64-msvc-2022-rust-${{ steps.rust.outputs.version }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'vendor/**/Cargo.toml') }}-
+            windows-x86_64-msvc-2022-rust-${{ steps.rust.outputs.version }}-
+
+      - name: Run unit tests
+        run: cargo test --release --locked -p nmbxd
+
+      - name: Build release executable
+        run: cargo build --release --locked -p nmbxd
+
+      - name: Package Windows distribution
+        run: ./scripts/package-windows.ps1 -SkipBuild
+
+      - name: Upload downloadable build
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nmbxd-windows-x86_64-${{ github.sha }}
+          path: |
+            dist/*.zip
+            dist/*.zip.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
   release:
     name: Publish tag release
-    needs: build
+    needs: [build, build-windows]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -96,12 +167,13 @@ jobs:
       - name: Download build artifacts
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: nmbxd-linux-x86_64-${{ github.sha }}
+          pattern: nmbxd-*-${{ github.sha }}
+          merge-multiple: true
           path: dist
 
       - name: Verify package checksums
         working-directory: dist
-        run: sha256sum --check ./*.tar.gz.sha256
+        run: sha256sum --check ./*.tar.gz.sha256 ./*.zip.sha256
 
       - name: Publish release assets
         env:
@@ -116,5 +188,5 @@ jobs:
               --title "X岛黎明版 $RELEASE_TAG" --generate-notes
           fi
           # Reruns replace assets on the same release instead of creating another.
-          gh release upload "$RELEASE_TAG" dist/*.tar.gz dist/*.tar.gz.sha256 --clobber
+          gh release upload "$RELEASE_TAG" dist/*.tar.gz dist/*.tar.gz.sha256 dist/*.zip dist/*.zip.sha256 --clobber
           gh release edit "$RELEASE_TAG" --draft=false
