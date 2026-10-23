@@ -934,7 +934,6 @@ impl Island {
             )
             .when_some(post.image_url(true), |d, thumbnail| {
                 let original = post.image_url(false).unwrap();
-                let actions = self.image_actions(("post-image-actions", id), original.clone(), cx);
                 d.child(
                     div()
                         .id(("post-image", id))
@@ -953,7 +952,6 @@ impl Island {
                             cx.notify();
                         })),
                 )
-                .child(actions)
             })
             .when(!missing.is_empty(), |d| {
                 d.child(
@@ -973,8 +971,15 @@ impl Island {
             })
             .child(
                 div()
+                    .id(("post-actions", id))
                     .flex()
+                    .items_center()
+                    .overflow_x_scroll()
+                    .whitespace_nowrap()
                     .gap_3()
+                    .when_some(post.image_url(false), |d, url| {
+                        d.child(self.image_actions(("post-image-actions", id), url, cx))
+                    })
                     .child(self.copy_text_button(("copy-post", id), &post.content, cx))
                     .child(button(p, ("quote", id), "引用回复").on_click(cx.listener(
                         move |this, _, window, cx| {
