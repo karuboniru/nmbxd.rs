@@ -10,7 +10,7 @@ use reqwest::{Url, blocking::Client};
 use std::{
     collections::{HashMap, VecDeque},
     io::{Cursor, Read},
-    sync::{Arc, OnceLock},
+    sync::{Arc, Condvar, Mutex, OnceLock},
     time::Duration,
 };
 
@@ -164,7 +164,7 @@ impl MediaStore {
     }
 }
 
-fn validate_url(value: &str) -> Result<Url, String> {
+pub(crate) fn validate_url(value: &str) -> Result<Url, String> {
     let url = Url::parse(value).map_err(|_| "图片地址无效".to_owned())?;
     if url.scheme() != "https"
         || url.host_str() != Some("image.nmb.best")
@@ -201,8 +201,38 @@ fn image_client() -> Result<&'static Client, String> {
         .map_err(Clone::clone)
 }
 
-fn fetch_image(value: &str) -> Result<Arc<RenderImage>, String> {
+// All media consumers share this limit, including clipboard and file exports.
+struct RequestPermit;
+static REQUESTS: (Mutex<usize>, Condvar) = (Mutex::new(0), Condvar::new());
+
+impl RequestPermit {
+    fn acquire() -> Self {
+        let (count, available) = &REQUESTS;
+        let mut active = count.lock().unwrap_or_else(|error| error.into_inner());
+        while *active >= MAX_CONCURRENT {
+            active = available
+                .wait(active)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+        *active += 1;
+        Self
+    }
+}
+
+impl Drop for RequestPermit {
+    fn drop(&mut self) {
+        let (count, available) = &REQUESTS;
+        let mut active = count.lock().unwrap_or_else(|error| error.into_inner());
+        *active -= 1;
+        available.notify_one();
+    }
+}
+
+/// Read original, bounded bytes on a worker, without API credentials or redirects.
+/// Callers must use `decode_rgba` before trusting them as an image.
+pub(crate) fn fetch_bytes(value: &str) -> Result<Vec<u8>, String> {
     let url = validate_url(value)?;
+    let _permit = RequestPermit::acquire();
     let response = image_client()?
         .get(url)
         .header(reqwest::header::ACCEPT_ENCODING, "identity")
@@ -217,8 +247,11 @@ fn fetch_image(value: &str) -> Result<Arc<RenderImage>, String> {
     {
         return Err("图片文件超过 12 MiB 限制".to_owned());
     }
-    let bytes = read_bounded(response)?;
-    decode_image(&bytes)
+    read_bounded(response)
+}
+
+fn fetch_image(value: &str) -> Result<Arc<RenderImage>, String> {
+    decode_image(&fetch_bytes(value)?)
 }
 
 fn read_bounded(reader: impl Read) -> Result<Vec<u8>, String> {
@@ -234,6 +267,17 @@ fn read_bounded(reader: impl Read) -> Result<Vec<u8>, String> {
 }
 
 fn decode_image(bytes: &[u8]) -> Result<Arc<RenderImage>, String> {
+    let (mut pixels, _) = decode_rgba(bytes)?;
+    // GPUI's RenderImage expects BGRA pixels.
+    for pixel in pixels.as_chunks_mut::<4>().0 {
+        pixel.swap(0, 2);
+    }
+    Ok(Arc::new(RenderImage::new(vec![Frame::new(pixels)])))
+}
+
+/// Decode one frame with the same format and allocation bounds as the viewer.
+/// Callers bound encoded bytes; clipboard PNGs may exceed the network body cap.
+pub(crate) fn decode_rgba(bytes: &[u8]) -> Result<(image::RgbaImage, image::ImageFormat), String> {
     let mut reader = ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|_| "无法识别图片格式".to_owned())?;
@@ -248,6 +292,7 @@ fn decode_image(bytes: &[u8]) -> Result<Arc<RenderImage>, String> {
     ) {
         return Err("暂不支持此图片格式".to_owned());
     }
+    let format = reader.format().unwrap();
     let mut limits = Limits::default();
     limits.max_image_width = Some(MAX_DIMENSION);
     limits.max_image_height = Some(MAX_DIMENSION);
@@ -269,14 +314,10 @@ fn decode_image(bytes: &[u8]) -> Result<Arc<RenderImage>, String> {
     decoder
         .set_limits(limits)
         .map_err(|_| "图片尺寸超过限制".to_owned())?;
-    let mut pixels = DynamicImage::from_decoder(decoder)
+    let pixels = DynamicImage::from_decoder(decoder)
         .map_err(|_| "图片解码失败".to_owned())?
         .into_rgba8();
-    // GPUI's RenderImage expects BGRA pixels.
-    for pixel in pixels.as_chunks_mut::<4>().0 {
-        pixel.swap(0, 2);
-    }
-    Ok(Arc::new(RenderImage::new(vec![Frame::new(pixels)])))
+    Ok((pixels, format))
 }
 
 #[cfg(test)]

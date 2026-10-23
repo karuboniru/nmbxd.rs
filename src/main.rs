@@ -2,6 +2,9 @@ mod appearance;
 mod assets;
 mod attachments;
 mod emoji;
+mod image_actions;
+mod image_clipboard;
+mod image_export;
 mod media;
 mod media_view;
 mod navigation;
@@ -9,6 +12,7 @@ mod panes;
 mod preview;
 mod preview_shortcuts;
 mod scrolling;
+mod selectable_content;
 mod settings;
 mod subscriptions;
 use appearance::{Appearance, Palette};
@@ -59,6 +63,14 @@ enum Response {
 }
 
 struct Island {
+    image_export_busy: bool,
+    content_views: std::cell::RefCell<
+        std::collections::VecDeque<(
+            ElementId,
+            String,
+            Entity<selectable_content::SelectableContent>,
+        )>,
+    >,
     preview_shortcut_subscription: Option<Subscription>,
     showing_subscriptions: bool,
     subscribed: HashSet<u64>,
@@ -242,6 +254,8 @@ impl Island {
         let media = cx.new(|_| media::MediaStore::new());
         cx.observe(&media, |_, _, cx| cx.notify()).detach();
         Self {
+            image_export_busy: false,
+            content_views: Default::default(),
             preview_shortcut_subscription: None,
             showing_subscriptions: false,
             subscribed: HashSet::new(),
@@ -810,6 +824,7 @@ impl Island {
             )
             .when_some(post.image_url(true), |d, thumbnail| {
                 let original = post.image_url(false).unwrap();
+                let actions = self.image_actions(("post-image-actions", id), original.clone(), cx);
                 d.child(
                     div()
                         .id(("post-image", id))
@@ -828,6 +843,7 @@ impl Island {
                             cx.notify();
                         })),
                 )
+                .child(actions)
             })
             .when(!missing.is_empty(), |d| {
                 d.child(
@@ -849,6 +865,7 @@ impl Island {
                 div()
                     .flex()
                     .gap_3()
+                    .child(self.copy_text_button(("copy-post", id), &post.content, cx))
                     .child(button(p, ("quote", id), "引用回复").on_click(cx.listener(
                         move |this, _, window, cx| {
                             this.compose(this.selected, Some(id), window, cx)
@@ -1854,6 +1871,7 @@ impl Render for Island {
                             .items_center()
                             .justify_between()
                             .child(div().text_sm().child("原图 · 动图暂显示首帧"))
+                            .child(self.image_actions("viewer-image-actions", url.clone(), cx))
                             .child(button(p, "close-image", "关闭原图").on_click(cx.listener(
                                 |this, _, _, cx| {
                                     this.viewing_image = None;
@@ -1918,6 +1936,11 @@ fn main() -> anyhow::Result<()> {
     Application::new()
         .with_assets(assets::Assets)
         .run(move |cx: &mut App| {
+            cx.on_app_quit(|cx| {
+                cx.background_executor()
+                    .spawn(async { image_clipboard::shutdown() })
+            })
+            .detach();
             emoji::init(cx).expect("Unable to load bundled emoji font");
             gpui_component::init(cx);
             cx.on_window_closed(|cx| {

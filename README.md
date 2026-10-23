@@ -102,7 +102,7 @@ cd nmbxd-版本-linux-架构
 
 ## 验证记录
 
-已在 Fedora 45 toolbox 完成 release 构建、63 项应用单元测试，另有 8 项 cosmic-text 测试、2 项窗口边缘回归测试和 `cargo clippy --all-targets -- -D warnings`。已检查 GNOME 下的 CSD 窗口和 Wayland 启动，以及夜间主题、系统字体下拉搜索、字体切换保存和设置文件 `0600` 权限。已在隔离 X11 / CSD 会话检查分隔线拖动、图片缩略图与原图、emoji 组合、Ctrl+V 图片草稿预览、自动翻页、末页刷新，以及最大化后关闭原图。Linux FileChooser portal 服务版本检查通过；尚未完成跨平台原生文件选择器实机测试。只读 API smoke 验证板块、串列表、回复页；未发送测试帖子。中文 IME 的实际输入仍需在桌面输入法环境中确认。
+已在 Fedora 45 toolbox 完成 release 构建、73 项应用单元测试，另有 8 项 cosmic-text 测试、2 项窗口边缘回归测试和 `cargo clippy --all-targets -- -D warnings`。已检查 GNOME 下的 CSD 窗口和 Wayland 启动，以及夜间主题、系统字体下拉搜索、字体切换保存和设置文件 `0600` 权限。已在隔离 X11 / CSD 会话检查分隔线拖动、图片缩略图与原图、emoji 组合、Ctrl+V 图片草稿预览、自动翻页、末页刷新，以及最大化后关闭原图。Linux FileChooser portal 服务版本检查通过；尚未完成跨平台原生文件选择器实机测试。只读 API smoke 验证板块、串列表、回复页；未发送测试帖子。中文 IME 的实际输入仍需在桌面输入法环境中确认。
 
 ![GNOME 中的夜间模式和客户端标题栏](docs/dark-mode.png)
 ![饼干与字体设置](docs/settings.png)
@@ -136,3 +136,14 @@ HTTP(S) 外链通过系统默认浏览器打开，保留 HTML 链接的目标地
 - 推荐先更新 `Cargo.toml` / `Cargo.lock` 版本并提交，再执行 `git tag v0.1.4 && git push origin v0.1.4`（版本号按实际填写）。压缩包名使用 Cargo 版本，Release 名使用 tag。
 - 构建只使用仓库源码，不需要配置 cookie 或任何自定义 secret；仅发布 job 使用 GitHub 自动提供的 `GITHUB_TOKEN` 写入 Release。PR job 没有仓库写权限。
 - Ubuntu 产物仍是动态链接程序，不是通用静态包；运行目标需有兼容的 glibc / 系统库。包内 `BUILD-OS.txt` 与 `DEPENDENCIES.txt` 可用于检查。不在 CI 中启动 GUI，也不向岛上发送内容。
+
+### 复制文字、图片与另存为（v0.1.4）
+
+- 阅读正文和引用预览可鼠标拖选，`Ctrl+C`（macOS `Cmd+C`）复制选中文字，`Ctrl+A` / `Cmd+A` 选择该条消息的全部正文；也可点“复制正文”。链接仍可点击，拖选链接文字不会打开它。
+- 正文图片、引用预览图片和原图界面提供“复制图片”和“图片另存为…”。复制使用原图首帧并转换为 PNG，便于粘贴到其他应用；下载保存原始字节，保留 GIF 动画。
+- 另存为先准备图片，再弹出系统保存对话框确认文件名和路径；Linux 严格使用 FileChooser portal，Windows/macOS 使用原生保存对话框。取消不写文件，现有文件不会被覆盖，请选择新名称。
+- 复制/下载沿用图片来源、12 MiB 响应体、解码尺寸与并发限制，不发送 cookie，不影响发帖草稿；错误显示在状态栏。文件写入失败时会明确提示，目标文件可能不完整。
+
+已在隔离 X11 会话实测拖选复制正文，并使用外部程序读取图片剪贴板的 PNG；原生保存对话框尚待桌面实机验证。
+
+图片复制使用 arboard 原生剪贴板。Linux 优先使用 Wayland data-control，不支持该协议的桌面（如 GNOME）需要可用的 XWayland；失败会显示错误，可改用“图片另存为”。退出应用后图片是否保留取决于桌面剪贴板管理器。

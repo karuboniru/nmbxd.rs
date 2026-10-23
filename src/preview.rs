@@ -23,45 +23,45 @@ impl Island {
         html: &str,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let id = id.into();
+        let mut cache = self.content_views.borrow_mut();
+        if let Some(index) = cache
+            .iter()
+            .position(|(key, source, _)| *key == id && source == html)
+        {
+            let entry = cache.remove(index).unwrap();
+            let entity = entry.2.clone();
+            cache.push_back(entry);
+            return entity.into_any_element();
+        }
+        cache.retain(|(key, _, _)| *key != id);
         let parsed = parse_content(html);
-        let ranges: Vec<_> = parsed.links.iter().map(|l| l.range.clone()).collect();
-        let targets: Vec<_> = parsed.links.into_iter().map(|l| l.target).collect();
-        let color = rgb(Palette::current(cx).accent).into();
-        let styled =
-            StyledText::new(parsed.text).with_highlights(ranges.iter().cloned().map(|r| {
-                (
-                    r,
-                    HighlightStyle {
-                        color: Some(color),
-                        ..Default::default()
-                    },
-                )
-            }));
-        let entity = cx.entity().downgrade();
-        let text = InteractiveText::new(id, styled).on_click(ranges, move |index, _, cx| {
-            cx.stop_propagation();
-            if let Some(target) = targets.get(index) {
-                match target {
+        let view = cx.entity().downgrade();
+        let entity = cx.new(|cx| {
+            selectable_content::SelectableContent::new(
+                parsed,
+                move |target, _, cx| match target {
                     LinkTarget::External(url) => cx.open_url(url),
                     LinkTarget::Reference(id) => {
-                        let _ = entity.update(cx, |this, cx| this.open_preview(*id, cx));
+                        let _ = view.update(cx, |this, cx| this.open_preview(*id, cx));
                     }
-                }
-            }
+                },
+                cx,
+            )
         });
-        div()
-            .capture_any_mouse_down(|event, _, cx| {
-                if event.button != MouseButton::Left {
-                    cx.stop_propagation();
-                }
-            })
-            .capture_any_mouse_up(|event, _, cx| {
-                if event.button != MouseButton::Left {
-                    cx.stop_propagation();
-                }
-            })
-            .child(text)
-            .into_any_element()
+        cache.push_back((id, html.to_owned(), entity.clone()));
+        while cache.len() > 128 {
+            // Protect an active drag/selection when a buffered tree contains
+            // more posts than the cache; otherwise each render evicts it.
+            let index = cache
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, (_, _, view))| view.read(cx).retention_priority())
+                .map(|(index, _)| index)
+                .unwrap();
+            cache.remove(index);
+        }
+        entity.into_any_element()
     }
 
     fn local_reference(&self, id: u64) -> Option<ReferencePreview> {
@@ -279,8 +279,20 @@ impl Island {
                             cx,
                         )),
                 );
+            body = body.child(self.copy_text_button(
+                ("copy-preview", generation),
+                &value.post.content,
+                cx,
+            ));
             if let Some(url) = value.post.image_url(true) {
                 body = body.child(media_view::tile(&self.media, url, px(240.), cx));
+                if let Some(original) = value.post.image_url(false) {
+                    body = body.child(self.image_actions(
+                        ("preview-image-actions", generation),
+                        original,
+                        cx,
+                    ));
+                }
             }
         }
         if frame.busy {

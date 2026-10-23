@@ -55,6 +55,7 @@ jobs:
           key: linux-x86_64-ubuntu24-rust-${{ steps.rust.outputs.version }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'vendor/**/Cargo.toml') }}-${{ github.sha }}
           restore-keys: |
             linux-x86_64-ubuntu24-rust-${{ steps.rust.outputs.version }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'vendor/**/Cargo.toml') }}-
+            linux-x86_64-ubuntu24-rust-${{ steps.rust.outputs.version }}-
 
       # Pure unit tests: no desktop session, cookie, or live posting required.
       # Use the release profile for tests too, reusing the expensive GPUI build.
