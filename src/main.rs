@@ -1,3 +1,5 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 mod appearance;
 mod assets;
 mod attachments;
@@ -991,7 +993,10 @@ impl Island {
 
     fn header(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let p = Palette::current(cx);
-        let client_decorated = matches!(window.window_decorations(), Decorations::Client { .. });
+        // GPUI's decoration query is Linux-specific; Windows returns Server even
+        // when appears_transparent hides the native title bar.
+        let client_decorated = cfg!(target_os = "windows")
+            || matches!(window.window_decorations(), Decorations::Client { .. });
         let control = |id: &'static str, label: &'static str| {
             div()
                 .id(id)
@@ -1096,24 +1101,45 @@ impl Island {
                     .flex()
                     .justify_end()
                     .gap_2()
-                    .child(control("window-minimize", "−").on_click(|_, window, cx| {
-                        cx.stop_propagation();
-                        window.minimize_window();
-                    }))
+                    .child(
+                        control("window-minimize", "−")
+                            .when(cfg!(target_os = "windows"), |d| {
+                                d.window_control_area(WindowControlArea::Min)
+                            })
+                            .when(!cfg!(target_os = "windows"), |d| {
+                                d.on_click(|_, window, cx| {
+                                    cx.stop_propagation();
+                                    window.minimize_window();
+                                })
+                            }),
+                    )
                     .child(
                         control(
                             "window-maximize",
                             if window.is_maximized() { "▣" } else { "□" },
                         )
-                        .on_click(|_, window, cx| {
-                            cx.stop_propagation();
-                            window.zoom_window();
+                        .when(cfg!(target_os = "windows"), |d| {
+                            d.window_control_area(WindowControlArea::Max)
+                        })
+                        .when(!cfg!(target_os = "windows"), |d| {
+                            d.on_click(|_, window, cx| {
+                                cx.stop_propagation();
+                                window.zoom_window();
+                            })
                         }),
                     )
-                    .child(control("window-close", "×").on_click(|_, window, cx| {
-                        cx.stop_propagation();
-                        window.remove_window();
-                    })),
+                    .child(
+                        control("window-close", "×")
+                            .when(cfg!(target_os = "windows"), |d| {
+                                d.window_control_area(WindowControlArea::Close)
+                            })
+                            .when(!cfg!(target_os = "windows"), |d| {
+                                d.on_click(|_, window, cx| {
+                                    cx.stop_propagation();
+                                    window.remove_window();
+                                })
+                            }),
+                    ),
             )
             .into_any_element()
     }
@@ -1127,6 +1153,8 @@ impl Island {
         let before = self.navigation.before();
         let after = self.navigation.after();
         div()
+            .flex()
+            .flex_col()
             .flex_shrink_0()
             .px_4()
             .pb_2()
@@ -1136,7 +1164,9 @@ impl Island {
                 div()
                     .flex()
                     .flex_wrap()
+                    .flex_shrink_0()
                     .items_center()
+                    .content_start()
                     .gap_2()
                     .child(
                         button(p, "previous-page", "上一页")
@@ -1193,7 +1223,9 @@ impl Island {
                 div()
                     .flex()
                     .flex_wrap()
+                    .flex_shrink_0()
                     .items_center()
+                    .content_start()
                     .gap_2()
                     .child(
                         div().text_xs().text_color(rgb(p.muted)).child(
@@ -1694,6 +1726,9 @@ impl Render for Island {
                 div()
                     .flex()
                     .flex_wrap()
+                    .flex_shrink_0()
+                    .items_center()
+                    .content_start()
                     .px_4()
                     .py_2()
                     .gap_2()
