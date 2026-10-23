@@ -7,9 +7,12 @@
 use gpui::{Context, RenderImage};
 use image::{DynamicImage, Frame, ImageDecoder, ImageReader, Limits};
 use reqwest::{Url, blocking::Client};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, VecDeque},
-    io::{Cursor, Read},
+    fs::{self, File, OpenOptions},
+    io::{Cursor, Read, Write},
+    path::{Path, PathBuf},
     sync::{Arc, Condvar, Mutex, OnceLock},
     time::Duration,
 };
@@ -34,6 +37,7 @@ struct Entry {
     state: MediaState,
     bytes: usize,
     touched: u64,
+    request_id: u64,
 }
 
 #[derive(Default)]
@@ -82,6 +86,7 @@ impl MediaStore {
                 state: MediaState::Loading,
                 bytes: 0,
                 touched: self.clock,
+                request_id: self.clock,
             },
         );
         self.queued.push_back(url.to_owned());
@@ -99,6 +104,20 @@ impl MediaStore {
         state
     }
 
+    /// Forget a thread's images, including requests already running. A later
+    /// visible load may request fresh bytes; old workers cannot refill the cache.
+    pub fn invalidate(&mut self, urls: &[String], cx: &mut Context<Self>) {
+        invalidate_cached_urls(cache_directory().as_deref(), urls, cache_generations());
+        for url in urls {
+            if let Some(entry) = self.entries.remove(url) {
+                self.cache_bytes -= entry.bytes;
+            }
+        }
+        self.queued.retain(|url| !urls.contains(url));
+        self.pump(cx);
+        cx.notify();
+    }
+
     fn pump(&mut self, cx: &mut Context<Self>) {
         while self.running < MAX_CONCURRENT {
             let Some(url) = self.queued.pop_front() else {
@@ -106,14 +125,18 @@ impl MediaStore {
             };
             self.running += 1;
             let request_url = url.clone();
+            let request_id = self.entries[&url].request_id;
+            let generation = current_generation(&request_url);
             let task = cx
                 .background_executor()
-                .spawn(async move { fetch_image(&request_url) });
+                .spawn(async move { fetch_image(&request_url, generation) });
             cx.spawn(async move |store, cx| {
                 let result = task.await;
                 let _ = store.update(cx, |store, cx| {
                     store.running -= 1;
-                    if let Some(entry) = store.entries.get_mut(&url) {
+                    if let Some(entry) = store.entries.get_mut(&url)
+                        && entry.request_id == request_id
+                    {
                         match result {
                             Ok(image) => {
                                 entry.bytes = image.as_bytes(0).map_or(0, <[u8]>::len);
@@ -228,10 +251,170 @@ impl Drop for RequestPermit {
     }
 }
 
-/// Read original, bounded bytes on a worker, without API credentials or redirects.
-/// Callers must use `decode_rgba` before trusting them as an image.
+// Generations serialize cache deletion with the final atomic rename. They also
+// cover export workers, which use the same byte cache as visible images.
+type CacheGenerations = Mutex<HashMap<String, u64>>;
+
+fn cache_generations() -> &'static CacheGenerations {
+    static GENERATIONS: OnceLock<CacheGenerations> = OnceLock::new();
+    GENERATIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cache_directory() -> Option<PathBuf> {
+    crate::config_paths::paths("media-cache").map(|paths| paths.0)
+}
+
+fn current_generation(value: &str) -> u64 {
+    let key = validate_url(value)
+        .map(|url| url.to_string())
+        .unwrap_or_else(|_| value.to_owned());
+    generation(cache_generations(), &key)
+}
+
+fn generation(generations: &CacheGenerations, url: &str) -> u64 {
+    generations
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(url)
+        .copied()
+        .unwrap_or(0)
+}
+
+fn cache_path(directory: &Path, url: &str) -> PathBuf {
+    directory.join(format!("{:x}", Sha256::digest(url.as_bytes())))
+}
+
+fn invalidate_cached_urls(
+    directory: Option<&Path>,
+    urls: &[String],
+    generations: &CacheGenerations,
+) {
+    let mut generations = generations
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    for value in urls {
+        let Ok(url) = validate_url(value) else {
+            continue;
+        };
+        let key = url.as_str();
+        let generation = generations.entry(key.to_owned()).or_default();
+        *generation = generation.wrapping_add(1);
+        if let Some(directory) = directory {
+            let _ = fs::remove_file(cache_path(directory, key));
+        }
+    }
+}
+
+fn read_cached(directory: &Path, url: &str) -> Option<Vec<u8>> {
+    let path = cache_path(directory, url);
+    let file = File::open(&path).ok()?;
+    let bytes = read_bounded(file).ok();
+    if bytes
+        .as_ref()
+        .is_some_and(|bytes| decode_rgba(bytes).is_ok())
+    {
+        bytes
+    } else {
+        let _ = fs::remove_file(path);
+        None
+    }
+}
+
+// The caller has bounded and decoded these bytes. Cache failures are best effort:
+// a read-only config directory must not prevent an otherwise successful image.
+fn write_cached(
+    directory: &Path,
+    url: &str,
+    bytes: &[u8],
+    expected_generation: u64,
+    generations: &CacheGenerations,
+) -> std::io::Result<()> {
+    fs::create_dir_all(directory)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
+    }
+    let temporary = directory.join(format!(".{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        let generations = generations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if generations.get(url).copied().unwrap_or(0) == expected_generation {
+            fs::rename(&temporary, cache_path(directory, url))?;
+        }
+        Ok(())
+    })();
+    let _ = fs::remove_file(temporary);
+    result
+}
+
+/// Read validated, bounded image bytes on a worker, using disk before HTTP.
 pub(crate) fn fetch_bytes(value: &str) -> Result<Vec<u8>, String> {
+    fetch_bytes_at_generation(value, current_generation(value))
+}
+
+fn fetch_bytes_at_generation(value: &str, expected_generation: u64) -> Result<Vec<u8>, String> {
+    let directory = cache_directory();
+    fetch_cached(
+        value,
+        directory.as_deref(),
+        expected_generation,
+        cache_generations(),
+        fetch_network_bytes,
+    )
+}
+
+fn fetch_cached(
+    value: &str,
+    directory: Option<&Path>,
+    expected_generation: u64,
+    generations: &CacheGenerations,
+    fetch: impl FnOnce(Url) -> Result<Vec<u8>, String>,
+) -> Result<Vec<u8>, String> {
     let url = validate_url(value)?;
+    let stale = || generation(generations, url.as_str()) != expected_generation;
+    if stale() {
+        return Err("图片缓存已清除，请重试".to_owned());
+    }
+    if let Some(bytes) = directory.and_then(|directory| read_cached(directory, url.as_str())) {
+        return if stale() {
+            Err("图片缓存已清除，请重试".to_owned())
+        } else {
+            Ok(bytes)
+        };
+    }
+    let bytes = fetch(url.clone())?;
+    if bytes.len() > MAX_BODY_BYTES {
+        return Err("图片文件超过 12 MiB 限制".to_owned());
+    }
+    decode_rgba(&bytes)?;
+    if stale() {
+        return Err("图片缓存已清除，请重试".to_owned());
+    }
+    if let Some(directory) = directory {
+        let _ = write_cached(
+            directory,
+            url.as_str(),
+            &bytes,
+            expected_generation,
+            generations,
+        );
+    }
+    Ok(bytes)
+}
+
+fn fetch_network_bytes(url: Url) -> Result<Vec<u8>, String> {
     let _permit = RequestPermit::acquire();
     let response = image_client()?
         .get(url)
@@ -250,8 +433,8 @@ pub(crate) fn fetch_bytes(value: &str) -> Result<Vec<u8>, String> {
     read_bounded(response)
 }
 
-fn fetch_image(value: &str) -> Result<Arc<RenderImage>, String> {
-    decode_image(&fetch_bytes(value)?)
+fn fetch_image(value: &str, generation: u64) -> Result<Arc<RenderImage>, String> {
+    decode_image(&fetch_bytes_at_generation(value, generation)?)
 }
 
 fn read_bounded(reader: impl Read) -> Result<Vec<u8>, String> {
@@ -324,6 +507,137 @@ pub(crate) fn decode_rgba(bytes: &[u8]) -> Result<(image::RgbaImage, image::Imag
 mod tests {
     use super::*;
 
+    const TEST_URL: &str = "https://image.nmb.best/image/cached.png";
+
+    struct TestCache(PathBuf);
+
+    impl TestCache {
+        fn new() -> Self {
+            Self(std::env::temp_dir().join(format!("rdnmb-media-test-{}", uuid::Uuid::new_v4())))
+        }
+    }
+
+    impl Drop for TestCache {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn png_bytes() -> Vec<u8> {
+        let mut bytes = Cursor::new(Vec::new());
+        image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 8, 0, 255]))
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        bytes.into_inner()
+    }
+
+    #[test]
+    fn persistent_cache_serves_validated_images_offline() {
+        let directory = TestCache::new();
+        let generations = Mutex::new(HashMap::new());
+        let bytes = png_bytes();
+        let fetched = fetch_cached(TEST_URL, Some(&directory.0), 0, &generations, |_| {
+            Ok(bytes.clone())
+        })
+        .unwrap();
+        assert_eq!(fetched, bytes);
+        // A fresh generation table models restarting the application.
+        let restarted = Mutex::new(HashMap::new());
+        let cached = fetch_cached(TEST_URL, Some(&directory.0), 0, &restarted, |_| {
+            panic!("cached images must not require network")
+        })
+        .unwrap();
+        assert_eq!(cached, bytes);
+        assert_eq!(
+            cache_path(&directory.0, TEST_URL)
+                .file_name()
+                .unwrap()
+                .len(),
+            64
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&directory.0).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                fs::metadata(cache_path(&directory.0, TEST_URL))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn corrupt_cache_is_evicted_and_replaced_from_network() {
+        let directory = TestCache::new();
+        fs::create_dir_all(&directory.0).unwrap();
+        fs::write(cache_path(&directory.0, TEST_URL), b"corrupt").unwrap();
+        let generations = Mutex::new(HashMap::new());
+        assert!(
+            fetch_cached(TEST_URL, Some(&directory.0), 0, &generations, |_| {
+                Err("offline".to_owned())
+            })
+            .is_err()
+        );
+        assert!(!cache_path(&directory.0, TEST_URL).exists());
+        let bytes = png_bytes();
+        assert_eq!(
+            fetch_cached(TEST_URL, Some(&directory.0), 0, &generations, |_| {
+                Ok(bytes.clone())
+            })
+            .unwrap(),
+            bytes
+        );
+        assert_eq!(read_cached(&directory.0, TEST_URL).unwrap(), bytes);
+    }
+
+    #[test]
+    fn invalid_network_images_never_enter_disk_cache() {
+        let directory = TestCache::new();
+        let generations = Mutex::new(HashMap::new());
+        for bytes in [b"invalid image".to_vec(), vec![0; MAX_BODY_BYTES + 1]] {
+            assert!(
+                fetch_cached(TEST_URL, Some(&directory.0), 0, &generations, |_| {
+                    Ok(bytes)
+                })
+                .is_err()
+            );
+            assert!(!cache_path(&directory.0, TEST_URL).exists());
+        }
+    }
+
+    #[test]
+    fn clearing_cache_fences_in_flight_fetch_and_atomic_commit() {
+        let directory = TestCache::new();
+        let generations = Mutex::new(HashMap::new());
+        let bytes = png_bytes();
+        let urls = [TEST_URL.to_owned()];
+        let result = fetch_cached(TEST_URL, Some(&directory.0), 0, &generations, |_| {
+            invalidate_cached_urls(Some(&directory.0), &urls, &generations);
+            Ok(bytes.clone())
+        });
+        assert!(result.is_err());
+        assert!(!cache_path(&directory.0, TEST_URL).exists());
+        // Covers invalidation after validation but before the atomic rename.
+        write_cached(&directory.0, TEST_URL, &bytes, 0, &generations).unwrap();
+        assert!(!cache_path(&directory.0, TEST_URL).exists());
+        assert_eq!(generation(&generations, TEST_URL), 1);
+        assert_eq!(
+            generation(&generations, "https://image.nmb.best/image/other.png"),
+            0
+        );
+        fetch_cached(TEST_URL, Some(&directory.0), 1, &generations, |_| Ok(bytes)).unwrap();
+        assert!(cache_path(&directory.0, TEST_URL).exists());
+        invalidate_cached_urls(Some(&directory.0), &urls, &generations);
+        assert!(!cache_path(&directory.0, TEST_URL).exists());
+    }
+
     #[test]
     fn restricts_images_to_fixed_https_origin_and_paths() {
         for valid in [
@@ -385,6 +699,7 @@ mod tests {
                 state: MediaState::Loading,
                 bytes: 0,
                 touched: 0,
+                request_id: 0,
             },
         );
         store.entries.insert(
@@ -393,6 +708,7 @@ mod tests {
                 state: MediaState::Failed("failure".into()),
                 bytes: 0,
                 touched: 1,
+                request_id: 1,
             },
         );
         assert!(store.evict_oldest());
