@@ -33,6 +33,17 @@ impl Appearance {
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
             .filter(|path| path.is_absolute())
+            .or_else(|| {
+                #[cfg(target_os = "windows")]
+                {
+                    std::env::var_os("APPDATA")
+                        .filter(|value| !value.is_empty())
+                        .map(PathBuf::from)
+                        .filter(|path| path.is_absolute())
+                }
+                #[cfg(not(target_os = "windows"))]
+                None
+            })
             .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
             .map(|base| base.join("nmbxd/appearance.json"))
     }

@@ -1,3 +1,5 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 mod appearance;
 mod assets;
 mod attachments;
@@ -991,7 +993,10 @@ impl Island {
 
     fn header(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let p = Palette::current(cx);
-        let client_decorated = matches!(window.window_decorations(), Decorations::Client { .. });
+        // GPUI's decoration query is Linux-specific; Windows returns Server even
+        // when appears_transparent hides the native title bar.
+        let client_decorated = cfg!(target_os = "windows")
+            || matches!(window.window_decorations(), Decorations::Client { .. });
         let control = |id: &'static str, label: &'static str| {
             div()
                 .id(id)
@@ -1004,11 +1009,14 @@ impl Island {
                 .text_lg()
                 .bg(rgb(p.sidebar))
                 .hover(move |d| d.bg(rgb(p.hover)))
-                .on_mouse_down(MouseButton::Left, |_, window, cx| {
-                    window.prevent_default();
-                    cx.stop_propagation();
+                // Native Windows caption handling must receive both events.
+                .when(!cfg!(target_os = "windows"), |d| {
+                    d.on_mouse_down(MouseButton::Left, |_, window, cx| {
+                        window.prevent_default();
+                        cx.stop_propagation();
+                    })
+                    .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 })
-                .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .child(label)
         };
         div()
@@ -1022,29 +1030,34 @@ impl Island {
             .bg(rgb(p.surface))
             .border_b_1()
             .border_color(rgb(p.border))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, _| this.title_drag = true),
-            )
-            .on_mouse_down_out(cx.listener(|this, _, _, _| this.title_drag = false))
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|this, event: &MouseUpEvent, window, cx| {
-                    this.title_drag = false;
-                    if event.click_count == 2 {
-                        window.zoom_window();
-                        cx.notify();
+            .when(cfg!(target_os = "windows"), |d| {
+                d.window_control_area(WindowControlArea::Drag)
+            })
+            .when(!cfg!(target_os = "windows"), |d| {
+                d.on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, _| this.title_drag = true),
+                )
+                .on_mouse_down_out(cx.listener(|this, _, _, _| this.title_drag = false))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                        this.title_drag = false;
+                        if event.click_count == 2 {
+                            window.zoom_window();
+                            cx.notify();
+                        }
+                    }),
+                )
+                .on_mouse_move(cx.listener(|this, _, window, _| {
+                    if this.title_drag {
+                        this.title_drag = false;
+                        window.start_window_move();
                     }
-                }),
-            )
-            .on_mouse_move(cx.listener(|this, _, window, _| {
-                if this.title_drag {
-                    this.title_drag = false;
-                    window.start_window_move();
-                }
-            }))
-            .on_mouse_down(MouseButton::Right, |event, window, _| {
-                window.show_window_menu(event.position)
+                }))
+                .on_mouse_down(MouseButton::Right, |event, window, _| {
+                    window.show_window_menu(event.position)
+                })
             })
             .child(
                 div()
@@ -1096,24 +1109,45 @@ impl Island {
                     .flex()
                     .justify_end()
                     .gap_2()
-                    .child(control("window-minimize", "−").on_click(|_, window, cx| {
-                        cx.stop_propagation();
-                        window.minimize_window();
-                    }))
+                    .child(
+                        control("window-minimize", "−")
+                            .when(cfg!(target_os = "windows"), |d| {
+                                d.window_control_area(WindowControlArea::Min)
+                            })
+                            .when(!cfg!(target_os = "windows"), |d| {
+                                d.on_click(|_, window, cx| {
+                                    cx.stop_propagation();
+                                    window.minimize_window();
+                                })
+                            }),
+                    )
                     .child(
                         control(
                             "window-maximize",
                             if window.is_maximized() { "▣" } else { "□" },
                         )
-                        .on_click(|_, window, cx| {
-                            cx.stop_propagation();
-                            window.zoom_window();
+                        .when(cfg!(target_os = "windows"), |d| {
+                            d.window_control_area(WindowControlArea::Max)
+                        })
+                        .when(!cfg!(target_os = "windows"), |d| {
+                            d.on_click(|_, window, cx| {
+                                cx.stop_propagation();
+                                window.zoom_window();
+                            })
                         }),
                     )
-                    .child(control("window-close", "×").on_click(|_, window, cx| {
-                        cx.stop_propagation();
-                        window.remove_window();
-                    })),
+                    .child(
+                        control("window-close", "×")
+                            .when(cfg!(target_os = "windows"), |d| {
+                                d.window_control_area(WindowControlArea::Close)
+                            })
+                            .when(!cfg!(target_os = "windows"), |d| {
+                                d.on_click(|_, window, cx| {
+                                    cx.stop_propagation();
+                                    window.remove_window();
+                                })
+                            }),
+                    ),
             )
             .into_any_element()
     }
@@ -1127,6 +1161,9 @@ impl Island {
         let before = self.navigation.before();
         let after = self.navigation.after();
         div()
+            .flex()
+            .flex_col()
+            .min_h_0()
             .flex_shrink_0()
             .px_4()
             .pb_2()
@@ -1135,8 +1172,15 @@ impl Island {
             .child(
                 div()
                     .flex()
-                    .flex_wrap()
+                    .id("page-navigation-row")
+                    .overflow_x_scroll()
+                    .w_full()
+                    .min_w_0()
+                    .min_h_0()
+                    .whitespace_nowrap()
+                    .flex_shrink_0()
                     .items_center()
+                    .content_start()
                     .gap_2()
                     .child(
                         button(p, "previous-page", "上一页")
@@ -1151,7 +1195,7 @@ impl Island {
                                 }
                             })),
                     )
-                    .child(div().text_xs().child(if current == 0 {
+                    .child(div().flex_shrink_0().text_xs().child(if current == 0 {
                         "— / — 页".to_string()
                     } else {
                         format!("{current} / {total} 页")
@@ -1174,6 +1218,7 @@ impl Island {
                     .child(
                         div()
                             .w(px(72.))
+                            .flex_shrink_0()
                             .child(Input::new(&self.page_input).disabled(loading || current == 0)),
                     )
                     .child(
@@ -1186,23 +1231,40 @@ impl Island {
                             })),
                     )
                     .when(loading, |d| {
-                        d.child(div().text_xs().text_color(rgb(p.muted)).child("加载中…"))
+                        d.child(
+                            div()
+                                .flex_shrink_0()
+                                .text_xs()
+                                .text_color(rgb(p.muted))
+                                .child("加载中…"),
+                        )
                     }),
             )
             .child(
                 div()
                     .flex()
-                    .flex_wrap()
+                    .id("page-buffer-row")
+                    .overflow_x_scroll()
+                    .w_full()
+                    .min_w_0()
+                    .min_h_0()
+                    .whitespace_nowrap()
+                    .flex_shrink_0()
                     .items_center()
+                    .content_start()
                     .gap_2()
                     .child(
-                        div().text_xs().text_color(rgb(p.muted)).child(
-                            range
-                                .map(|(first, last)| {
-                                    format!("已加载 {first}–{last} 页 · 跳转后从目标页重新聚合")
-                                })
-                                .unwrap_or_else(|| "尚未加载页面".into()),
-                        ),
+                        div()
+                            .flex_shrink_0()
+                            .text_xs()
+                            .text_color(rgb(p.muted))
+                            .child(
+                                range
+                                    .map(|(first, last)| {
+                                        format!("已加载 {first}–{last} 页 · 跳转后从目标页重新聚合")
+                                    })
+                                    .unwrap_or_else(|| "尚未加载页面".into()),
+                            ),
                     )
                     .when(self.aggregate, |d| {
                         d.child(
@@ -1273,6 +1335,7 @@ fn apply_fonts(settings: &Settings, cx: &mut App) {
 fn button(p: Palette, id: impl Into<ElementId>, label: impl Into<SharedString>) -> Stateful<Div> {
     div()
         .id(id)
+        .flex_shrink_0()
         .px_3()
         .py_2()
         .rounded_md()
@@ -1693,7 +1756,16 @@ impl Render for Island {
             .child(
                 div()
                     .flex()
-                    .flex_wrap()
+                    .id("reader-actions-row")
+                    .overflow_x_scroll()
+                    .w_full()
+                    .min_w_0()
+                    .min_h_0()
+                    // Keep toolbar height independent of wrapped flex intrinsic measurements.
+                    .whitespace_nowrap()
+                    .flex_shrink_0()
+                    .items_center()
+                    .content_start()
                     .px_4()
                     .py_2()
                     .gap_2()
