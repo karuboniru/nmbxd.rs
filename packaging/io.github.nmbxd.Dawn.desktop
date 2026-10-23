@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=X岛黎明版
+Comment=原生 X 岛阅读与交流客户端
+Exec=nmbxd
+TryExec=nmbxd
+Icon=io.github.nmbxd.Dawn
+Terminal=false
+Categories=Network;News;
+StartupNotify=true

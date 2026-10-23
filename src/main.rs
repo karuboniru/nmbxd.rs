@@ -1,0 +1,1956 @@
+mod appearance;
+mod assets;
+mod attachments;
+mod emoji;
+mod media;
+mod media_view;
+mod navigation;
+mod panes;
+mod preview;
+mod preview_shortcuts;
+mod scrolling;
+mod settings;
+mod subscriptions;
+use appearance::{Appearance, Palette};
+use gpui::{prelude::*, *};
+use gpui_component::{
+    Root,
+    input::{Input, InputEvent, InputState},
+    menu::{ContextMenuExt, PopupMenuItem},
+};
+use navigation::{Navigation, PageAction, PageMode, parse_page};
+use nmbxd::{
+    api::ApiClient,
+    model::{ForumGroup, Post},
+    tree::ThreadTree,
+};
+use scrolling::ScrollPaging;
+use settings::{Settings, SettingsEvent, SettingsPanel};
+use std::{collections::HashSet, sync::mpsc, time::Duration};
+
+const APP_NAME: &str = "X岛黎明版";
+
+enum Request {
+    Feed(u64, String, u32),
+    FeedChange(String, u64, bool),
+    Reference(u64, u64, std::sync::Weak<()>),
+    JumpProbe(u64, u64, std::sync::Weak<()>),
+    Configure(Settings),
+    Forums,
+    Forum(u64, i64, u32),
+    Thread(u64, u64, u32),
+    Send(
+        Option<u64>,
+        i64,
+        String,
+        String,
+        Option<nmbxd::api::ImageAttachment>,
+    ),
+}
+enum Response {
+    FeedChanged(String, u64, bool, Result<String, String>),
+    Reference(u64, Result<nmbxd::api::ReferencePreview, String>),
+    JumpProbe(u64, Result<Post, String>),
+    Configured(Result<Settings, String>),
+    Forums(Result<Vec<ForumGroup>, String>),
+    Forum(u64, u32, Result<Vec<Post>, String>),
+    Thread(u64, u32, Result<Post, String>),
+    Sent(Result<String, String>),
+}
+
+struct Island {
+    preview_shortcut_subscription: Option<Subscription>,
+    showing_subscriptions: bool,
+    subscribed: HashSet<u64>,
+    subscription_pending: HashSet<u64>,
+    previews: Vec<preview::Frame>,
+    preview_serial: u64,
+    settings: Settings,
+    media: Entity<media::MediaStore>,
+    viewing_image: Option<String>,
+    settings_panel: Option<Entity<SettingsPanel>>,
+    settings_saving: bool,
+    appearance: Appearance,
+    title_drag: bool,
+    tx: mpsc::Sender<Request>,
+    groups: Vec<ForumGroup>,
+    forum: i64,
+    forum_name: String,
+    threads: Vec<Post>,
+    forum_page: u32,
+    forum_epoch: u64,
+    forum_scroll: ScrollHandle,
+    forum_paging: ScrollPaging,
+    forum_end: bool,
+    thread_epoch: u64,
+    tree: Option<ThreadTree>,
+    selected: Option<u64>,
+    navigation: Navigation,
+    page_input: Entity<InputState>,
+    reading_revision: u64,
+    reading_scroll: ScrollHandle,
+    reading_paging: ScrollPaging,
+    reading_reset_pending: bool,
+    reading_retry: Option<(u32, PageMode)>,
+    panes: panes::PaneLayout,
+    groups_loading: bool,
+    forum_loading: bool,
+    aggregate: bool,
+    collapsed: HashSet<u64>,
+    composing: bool,
+    compose_target: Option<u64>,
+    compose_forum: i64,
+    compose_label: String,
+    animation: u64,
+    body: Entity<InputState>,
+    title: Entity<InputState>,
+    sending: bool,
+    clear_draft: bool,
+    attachment: Option<attachments::DraftImage>,
+    attachment_loading: bool,
+    attachment_revision: u64,
+    cookie: bool,
+    notice: String,
+}
+
+impl Island {
+    fn new(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        api: ApiClient,
+        settings: Settings,
+    ) -> Self {
+        let appearance = Appearance::load();
+        appearance.apply(window, cx);
+        apply_fonts(&settings, cx);
+        cx.observe_window_appearance(window, |this, window, cx| {
+            if this.appearance == Appearance::System {
+                this.appearance.apply(window, cx);
+                apply_fonts(&this.settings, cx);
+                cx.notify();
+            }
+        })
+        .detach();
+        let cookie = api.has_cookie();
+        let (tx, rx) = mpsc::channel();
+        let (out, incoming) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut api = api;
+            while let Ok(request) = rx.recv() {
+                let result = match request {
+                    Request::Feed(g, uuid, page) => Response::Forum(
+                        g,
+                        page,
+                        api.subscriptions(&uuid, page).map_err(|e| e.to_string()),
+                    ),
+                    Request::FeedChange(uuid, id, add) => {
+                        let result = if add {
+                            api.add_subscription(&uuid, id)
+                        } else {
+                            api.remove_subscription(&uuid, id)
+                        };
+                        Response::FeedChanged(uuid, id, add, result.map_err(|e| e.to_string()))
+                    }
+                    Request::Configure(mut settings) => {
+                        let result = (|| -> anyhow::Result<Settings> {
+                            let client = ApiClient::with_website_base(
+                                Some(&settings.cookie),
+                                &settings.website_base,
+                            )?;
+                            settings.website_base = client.website_base().to_owned();
+                            settings.save()?;
+                            api = client;
+                            Ok(settings)
+                        })()
+                        .map_err(|error| error.to_string());
+                        Response::Configured(result)
+                    }
+                    Request::Reference(g, id, lifetime) => {
+                        if lifetime.upgrade().is_none() {
+                            continue;
+                        }
+                        Response::Reference(g, api.reference(id).map_err(|e| e.to_string()))
+                    }
+                    Request::JumpProbe(g, id, lifetime) => {
+                        if lifetime.upgrade().is_none() {
+                            continue;
+                        }
+                        Response::JumpProbe(g, api.thread_page(id, 1).map_err(|e| e.to_string()))
+                    }
+                    Request::Forums => {
+                        Response::Forums(api.forum_groups().map_err(|e| e.to_string()))
+                    }
+                    Request::Forum(g, id, page) => Response::Forum(
+                        g,
+                        page,
+                        api.forum_page(id, page).map_err(|e| e.to_string()),
+                    ),
+                    Request::Thread(g, id, page) => Response::Thread(
+                        g,
+                        page,
+                        api.thread_page(id, page).map_err(|e| e.to_string()),
+                    ),
+                    Request::Send(target, fid, title, body, image) => Response::Sent(
+                        match target {
+                            Some(id) => api.reply_with_image(id, "", &title, &body, image.as_ref()),
+                            None => {
+                                api.post_thread_with_image(fid, "", &title, &body, image.as_ref())
+                            }
+                        }
+                        .map_err(|e| e.to_string()),
+                    ),
+                };
+                if out.send(result).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(800));
+            }
+        });
+        cx.spawn(async move |view, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                if view
+                    .update(cx, |this, cx| {
+                        while let Ok(response) = incoming.try_recv() {
+                            this.receive(response, cx);
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+        tx.send(Request::Forums).ok();
+        let page_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("页码")
+                .validate(|value, _| {
+                    value.len() <= 10 && value.bytes().all(|byte| byte.is_ascii_digit())
+                })
+        });
+        cx.subscribe(&page_input, |this, _, event, cx| {
+            if matches!(event, InputEvent::PressEnter { .. }) {
+                this.jump_to_page(cx);
+            }
+        })
+        .detach();
+        let panes = panes::PaneLayout::new(cx);
+        let media = cx.new(|_| media::MediaStore::new());
+        cx.observe(&media, |_, _, cx| cx.notify()).detach();
+        Self {
+            preview_shortcut_subscription: None,
+            showing_subscriptions: false,
+            subscribed: HashSet::new(),
+            subscription_pending: HashSet::new(),
+            previews: Vec::new(),
+            preview_serial: 0,
+            settings,
+            media,
+            viewing_image: None,
+            settings_panel: None,
+            settings_saving: false,
+            appearance,
+            title_drag: false,
+            tx,
+            groups: vec![],
+            forum: 4,
+            forum_name: "综合版1".into(),
+            threads: vec![],
+            forum_page: 0,
+            forum_epoch: 0,
+            forum_scroll: ScrollHandle::new(),
+            forum_paging: ScrollPaging::default(),
+            forum_end: false,
+            thread_epoch: 0,
+            tree: None,
+            selected: None,
+            navigation: Navigation::default(),
+            page_input,
+            reading_revision: 0,
+            reading_scroll: ScrollHandle::new(),
+            reading_paging: ScrollPaging::default(),
+            reading_reset_pending: false,
+            reading_retry: None,
+            panes,
+            groups_loading: true,
+            forum_loading: false,
+            aggregate: false,
+            collapsed: HashSet::new(),
+            composing: false,
+            compose_target: None,
+            compose_forum: 4,
+            compose_label: String::new(),
+            animation: 0,
+            body: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .multi_line(true)
+                    .placeholder("在这里写下想说的话…")
+            }),
+            title: cx.new(|cx| InputState::new(window, cx).placeholder("标题（可选）")),
+            sending: false,
+            clear_draft: false,
+            attachment: None,
+            attachment_loading: false,
+            attachment_revision: 0,
+            cookie,
+            notice: "正在连接岛屿…".into(),
+        }
+    }
+
+    fn receive(&mut self, response: Response, cx: &mut Context<Self>) {
+        match response {
+            Response::FeedChanged(uuid, id, add, result) => {
+                self.receive_subscription(uuid, id, add, result, cx)
+            }
+            Response::Reference(g, result) => self.receive_preview(g, result),
+            Response::JumpProbe(g, result) => self.receive_jump(g, result, cx),
+            Response::Configured(result) => {
+                self.settings_saving = false;
+                match result {
+                    Ok(settings) => {
+                        self.cookie = !settings.cookie.trim().is_empty();
+                        apply_fonts(&settings, cx);
+                        let subscription_changed =
+                            self.settings.subscription_id != settings.subscription_id;
+                        self.settings = settings;
+                        if subscription_changed {
+                            self.subscribed.clear();
+                            self.subscription_pending.clear();
+                            if self.showing_subscriptions {
+                                self.load_subscriptions(cx);
+                            }
+                        }
+                        self.settings_panel = None;
+                        self.notice = "设置已保存，后续请求将使用新设置".into();
+                        cx.refresh_windows();
+                    }
+                    Err(error) => {
+                        if let Some(panel) = &self.settings_panel {
+                            panel.update(cx, |panel, cx| panel.set_error(error, cx));
+                        }
+                    }
+                }
+            }
+            Response::Forums(result) => {
+                self.groups_loading = false;
+                match result {
+                    Ok(groups) => {
+                        self.groups = groups;
+                        self.load_forum(4, "综合版1".into(), cx);
+                    }
+                    Err(e) => self.notice = e,
+                }
+            }
+            Response::Forum(g, page, result) if g == self.forum_epoch => {
+                self.forum_loading = false;
+                match result {
+                    Ok(posts) => {
+                        if self.showing_subscriptions {
+                            if page == 1 {
+                                self.subscribed.clear();
+                            }
+                            self.subscribed.extend(posts.iter().map(|p| p.id));
+                        }
+                        if page == 1 {
+                            self.threads.clear();
+                        }
+                        let previous_len = self.threads.len();
+                        let returned_empty = posts.is_empty();
+                        for post in posts {
+                            if !self.threads.iter().any(|p| p.id == post.id) {
+                                self.threads.push(post);
+                            }
+                        }
+                        // Forum pages have no total; pinned posts may repeat and
+                        // page size alone cannot establish the end.
+                        self.forum_end = if self.showing_subscriptions {
+                            returned_empty
+                        } else {
+                            self.threads.len() == previous_len
+                        };
+                        if !self.forum_end {
+                            self.forum_page = page;
+                        }
+                        self.forum_paging.failed = false;
+                        self.notice = "慢慢浏览，自在交流".into();
+                    }
+                    Err(e) => {
+                        self.forum_paging.failed = true;
+                        self.notice = e;
+                    }
+                }
+            }
+            Response::Thread(g, page, result) if g == self.thread_epoch => match result {
+                Ok(post) => {
+                    let previous_page = self.navigation.current();
+                    if self.navigation.receive(page, Some(post)) {
+                        self.tree = self.navigation.tree();
+                        if self.navigation.current() != previous_page || self.reading_reset_pending
+                        {
+                            self.reset_reading_scroll();
+                        }
+                        self.reading_reset_pending = false;
+                        self.reading_retry = None;
+                        self.reading_paging.failed = false;
+                        self.notice = format!("已加载第 {page} 页 · 引用树仅聚合已加载范围");
+                    }
+                }
+                Err(error) => {
+                    self.navigation.receive(page, None);
+                    self.reading_reset_pending = false;
+                    self.reading_paging.failed = true;
+                    self.notice = format!("第 {page} 页加载失败，已保留当前内容：{error}");
+                }
+            },
+            Response::Sent(result) => {
+                self.sending = false;
+                match result {
+                    Ok(message) => {
+                        self.notice = format!("发送结果：{message}");
+                        self.composing = false;
+                        self.clear_draft = true;
+                    }
+                    Err(e) => {
+                        self.notice = format!("发送未确认，草稿已保留。请先检查串再重试：{e}")
+                    }
+                }
+            }
+            _ => {}
+        }
+        cx.notify();
+    }
+
+    fn load_forum(&mut self, id: i64, name: String, cx: &mut Context<Self>) {
+        if self.forum_loading {
+            return;
+        }
+        self.showing_subscriptions = false;
+        self.forum = id;
+        self.forum_name = name;
+        self.forum_epoch += 1;
+        self.threads.clear();
+        self.forum_page = 0;
+        self.forum_end = false;
+        self.forum_scroll = ScrollHandle::new();
+        self.forum_paging = ScrollPaging::default();
+        self.request_forum_next(cx);
+    }
+    fn open_thread(&mut self, id: u64, cx: &mut Context<Self>) {
+        if self.navigation.loading() || self.selected == Some(id) {
+            return;
+        }
+        self.selected = Some(id);
+        self.tree = None;
+        self.navigation = Navigation::default();
+        self.reset_reading_scroll();
+        self.reading_paging = ScrollPaging::default();
+        self.reading_reset_pending = false;
+        self.reading_retry = None;
+        self.thread_epoch += 1;
+        self.collapsed.clear();
+        self.request_page(1, PageMode::Navigate, cx);
+    }
+
+    fn request_page(&mut self, page: u32, mode: PageMode, cx: &mut Context<Self>) {
+        let Some(id) = self.selected else {
+            return;
+        };
+        match self.navigation.request(page, mode) {
+            PageAction::Ignored => return,
+            PageAction::Cached => {
+                self.tree = self.navigation.tree();
+                if !matches!(mode, PageMode::Buffer | PageMode::Recheck) {
+                    self.reset_reading_scroll();
+                }
+                self.reading_retry = None;
+                self.reading_paging.failed = false;
+                self.notice = format!("第 {page} 页 · 使用已加载内容");
+            }
+            PageAction::Fetch => {
+                self.reading_reset_pending = !matches!(mode, PageMode::Buffer | PageMode::Recheck);
+                self.reading_retry = Some((page, mode));
+                self.reading_paging.failed = false;
+                self.notice = format!("正在加载第 {page} 页…");
+                if self
+                    .tx
+                    .send(Request::Thread(self.thread_epoch, id, page))
+                    .is_err()
+                {
+                    self.navigation.receive(page, None);
+                    self.reading_reset_pending = false;
+                    self.reading_paging.failed = true;
+                    self.notice = "后台服务不可用，请重启客户端".into();
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn reset_reading_scroll(&mut self) {
+        self.reading_revision += 1;
+        self.reading_scroll = ScrollHandle::new();
+        self.reading_paging.check_pending = false;
+    }
+
+    fn request_forum_next(&mut self, cx: &mut Context<Self>) {
+        if self.forum_loading || self.forum_end {
+            return;
+        }
+        let Some(page) = self.forum_page.checked_add(1) else {
+            self.forum_end = true;
+            return;
+        };
+        self.forum_loading = true;
+        self.forum_paging.failed = false;
+        let request = if self.showing_subscriptions {
+            Request::Feed(
+                self.forum_epoch,
+                self.settings.subscription_id.clone(),
+                page,
+            )
+        } else {
+            Request::Forum(self.forum_epoch, self.forum, page)
+        };
+        if self.tx.send(request).is_err() {
+            self.forum_loading = false;
+            self.forum_paging.failed = true;
+            self.notice = "后台服务不可用，请重启客户端".into();
+        }
+        cx.notify();
+    }
+
+    fn reading_next(&self) -> Option<(u32, PageMode)> {
+        if self.navigation.current() == 0 {
+            return Some((1, PageMode::Navigate));
+        }
+        if self.aggregate {
+            self.navigation.after().map(|page| (page, PageMode::Buffer))
+        } else {
+            self.navigation
+                .current()
+                .checked_add(1)
+                .filter(|&page| page <= self.navigation.total())
+                .map(|page| (page, PageMode::Navigate))
+        }
+    }
+
+    fn scroll_forum(
+        &mut self,
+        event: &ScrollWheelEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let delta = event.delta.pixel_delta(px(20.)).y;
+        let downward = delta < px(0.);
+        if delta == px(0.)
+            || self.forum_loading
+            || self.forum_end
+            || self.forum_paging.check_pending
+        {
+            return;
+        }
+        self.forum_paging.check_pending = true;
+        let epoch = self.forum_epoch;
+        // The built-in wheel listener applies the scroll offset during this
+        // event. Inspect it after dispatch, rather than using the old offset.
+        cx.defer_in(window, move |this, _, cx| {
+            if this.forum_epoch != epoch {
+                return;
+            }
+            this.forum_paging.check_pending = false;
+            let at_bottom =
+                this.forum_scroll.offset().y + this.forum_scroll.max_offset().height <= px(2.);
+            if !this.forum_loading
+                && !this.forum_end
+                && this.forum_paging.on_scroll(at_bottom, downward)
+            {
+                this.request_forum_next(cx);
+            }
+            cx.notify();
+        });
+    }
+
+    fn scroll_reading(
+        &mut self,
+        event: &ScrollWheelEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let delta = event.delta.pixel_delta(px(20.)).y;
+        let downward = delta < px(0.);
+        if delta == px(0.)
+            || self.selected.is_none()
+            || self.navigation.loading()
+            || self.reading_paging.check_pending
+        {
+            return;
+        }
+        self.reading_paging.check_pending = true;
+        let revision = self.reading_revision;
+        cx.defer_in(window, move |this, _, cx| {
+            if this.reading_revision != revision {
+                return;
+            }
+            this.reading_paging.check_pending = false;
+            let at_bottom =
+                this.reading_scroll.offset().y + this.reading_scroll.max_offset().height <= px(2.);
+            if !this.navigation.loading()
+                && this.reading_paging.on_scroll(at_bottom, downward)
+                && let Some((page, mode)) = this.reading_next()
+            {
+                this.request_page(page, mode, cx);
+            }
+            cx.notify();
+        });
+    }
+
+    fn jump_to_page(&mut self, cx: &mut Context<Self>) {
+        if self.navigation.loading() || self.navigation.current() == 0 {
+            return;
+        }
+        let value = self.page_input.read(cx).value();
+        if let Some(page) = parse_page(value.as_ref(), self.navigation.total()) {
+            self.request_page(page, PageMode::Jump, cx);
+        } else {
+            self.notice = format!("请输入 1–{} 之间的整数页码", self.navigation.total());
+            cx.notify();
+        }
+    }
+
+    fn compose(
+        &mut self,
+        target: Option<u64>,
+        quote: Option<u64>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.sending {
+            return;
+        }
+        // Never silently retarget an existing draft.
+        if (!self.body.read(cx).value().trim().is_empty()
+            || !self.title.read(cx).value().trim().is_empty()
+            || self.attachment.is_some()
+            || self.attachment_loading)
+            && (target != self.compose_target
+                || (target.is_none() && self.forum != self.compose_forum))
+        {
+            self.notice = "请先发送或清空当前草稿，再切换发帖目标".into();
+            cx.notify();
+            return;
+        }
+        self.compose_target = target;
+        self.compose_forum = self.forum;
+        self.compose_label = target
+            .map(|id| format!("回复 No.{id}"))
+            .unwrap_or_else(|| format!("发串到 {}", self.forum_name));
+        if let Some(id) = quote {
+            let current = self.body.read(cx).value();
+            self.body.update(cx, |input, cx| {
+                input.set_value(format!("{current}\n>>No.{id}\n"), window, cx)
+            });
+        }
+        self.composing = true;
+        self.animation += 1;
+        self.body.update(cx, |input, cx| input.focus(window, cx));
+        cx.notify();
+    }
+    fn send(&mut self, cx: &mut Context<Self>) {
+        if self.sending || !self.cookie || self.attachment_loading {
+            return;
+        }
+        let body = self.body.read(cx).value().to_string();
+        if body.trim().is_empty() && self.attachment.is_none() {
+            self.notice = "请填写正文或添加图片后再发送".into();
+            cx.notify();
+            return;
+        }
+        self.sending = true;
+        self.tx
+            .send(Request::Send(
+                self.compose_target,
+                self.compose_forum,
+                self.title.read(cx).value().to_string(),
+                body,
+                self.attachment
+                    .as_ref()
+                    .map(|image| image.attachment.clone()),
+            ))
+            .ok();
+        cx.notify();
+    }
+
+    fn choose_image(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.sending || self.attachment_loading {
+            return;
+        }
+        self.attachment_loading = true;
+        self.attachment_revision += 1;
+        let revision = self.attachment_revision;
+        let picker = attachments::pick_image(window);
+        cx.spawn(async move |this, cx| {
+            let result = match picker.await {
+                Ok(Some(path)) => Some(
+                    cx.background_executor()
+                        .spawn(async move { attachments::load_file(path) })
+                        .await,
+                ),
+                Ok(None) => None,
+                Err(error) => Some(Err(error)),
+            };
+            let _ = this.update(cx, |this, cx| {
+                if this.attachment_revision != revision {
+                    return;
+                }
+                this.attachment_loading = false;
+                if let Some(result) = result {
+                    match result {
+                        Ok(image) => {
+                            this.attachment = Some(image);
+                            this.notice = "图片已加入草稿，点击发送才会上传".into();
+                        }
+                        Err(error) => this.notice = error,
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn paste_image(&mut self, explicit: bool, cx: &mut Context<Self>) -> bool {
+        if self.sending || self.attachment_loading {
+            return false;
+        }
+        let Some(image) = cx
+            .read_from_clipboard()
+            .and_then(attachments::clipboard_image)
+        else {
+            if explicit {
+                self.notice = "剪贴板中没有图片；可复制截图后粘贴，或使用选择图片".into();
+                cx.notify();
+            }
+            return false;
+        };
+        self.attachment_loading = true;
+        self.attachment_revision += 1;
+        let revision = self.attachment_revision;
+        let task = cx
+            .background_executor()
+            .spawn(async move { attachments::load_clipboard(image) });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.attachment_revision != revision {
+                    return;
+                }
+                this.attachment_loading = false;
+                match result {
+                    Ok(image) => {
+                        this.attachment = Some(image);
+                        this.notice = "剪贴板图片已加入草稿，点击发送才会上传".into();
+                    }
+                    Err(error) => this.notice = error,
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+        true
+    }
+
+    fn post_card(
+        &self,
+        post: &Post,
+        depth: usize,
+        missing: &[u64],
+        children: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let p = Palette::current(cx);
+        let id = post.id;
+        let collapsed = self.collapsed.contains(&id);
+        div()
+            .ml(px((depth.min(7) * 16) as f32))
+            .mb_3()
+            .p_4()
+            .bg(rgb(p.surface))
+            .rounded_lg()
+            .border_1()
+            .border_color(rgb(p.border))
+            .child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .text_xs()
+                    .text_color(rgb(p.muted))
+                    .child(format!("{}  ·  No.{}", post.user_hash, id))
+                    .child(post.now.to_string()),
+            )
+            .when(post.title != "无标题" && !post.title.is_empty(), |d| {
+                d.child(
+                    div()
+                        .mt_2()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_size(px(self.settings.body_font_size))
+                        .child(post.title.clone()),
+                )
+            })
+            .child(
+                div()
+                    .my_3()
+                    .text_size(px(self.settings.body_font_size))
+                    .child(self.rich_content(("post-content", id), &post.content, cx)),
+            )
+            .when_some(post.image_url(true), |d, thumbnail| {
+                let original = post.image_url(false).unwrap();
+                d.child(
+                    div()
+                        .id(("post-image", id))
+                        .my_2()
+                        .cursor_pointer()
+                        .child(media_view::tile(&self.media, thumbnail, px(220.), cx))
+                        .child(
+                            div()
+                                .mt_1()
+                                .text_xs()
+                                .text_color(rgb(p.muted))
+                                .child("点击查看原图"),
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.viewing_image = Some(original.clone());
+                            cx.notify();
+                        })),
+                )
+            })
+            .when(!missing.is_empty(), |d| {
+                d.child(
+                    div()
+                        .mb_2()
+                        .text_xs()
+                        .text_color(rgb(p.muted))
+                        .child(format!(
+                            "未加载 / 串外引用：{}",
+                            missing
+                                .iter()
+                                .map(|id| format!("No.{id}"))
+                                .collect::<Vec<_>>()
+                                .join(" · ")
+                        )),
+                )
+            })
+            .child(
+                div()
+                    .flex()
+                    .gap_3()
+                    .child(button(p, ("quote", id), "引用回复").on_click(cx.listener(
+                        move |this, _, window, cx| {
+                            this.compose(this.selected, Some(id), window, cx)
+                        },
+                    )))
+                    .when(children && self.aggregate, |d| {
+                        d.child(
+                            button(
+                                p,
+                                ("fold", id),
+                                if collapsed {
+                                    "展开分支"
+                                } else {
+                                    "收起分支"
+                                },
+                            )
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    if !this.collapsed.remove(&id) {
+                                        this.collapsed.insert(id);
+                                    }
+                                    cx.notify();
+                                },
+                            )),
+                        )
+                    }),
+            )
+            .into_any_element()
+    }
+
+    fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings_panel.is_some() || self.sending {
+            return;
+        }
+        let panel = cx.new(|cx| SettingsPanel::new(self.settings.clone(), window, cx));
+        cx.subscribe_in(&panel, window, |this, panel, event, _, cx| {
+            match event {
+                SettingsEvent::Save(settings) if !this.settings_saving => {
+                    this.settings_saving = true;
+                    panel.update(cx, |panel, cx| panel.set_saving(true, cx));
+                    if this.tx.send(Request::Configure(settings.clone())).is_err() {
+                        this.settings_saving = false;
+                        panel.update(cx, |panel, cx| {
+                            panel.set_error("后台服务不可用，请重启客户端", cx)
+                        });
+                    }
+                }
+                SettingsEvent::Close if !this.settings_saving => this.settings_panel = None,
+                _ => {}
+            }
+            cx.notify();
+        })
+        .detach();
+        self.settings_panel = Some(panel);
+        cx.notify();
+    }
+
+    fn header(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let p = Palette::current(cx);
+        let client_decorated = matches!(window.window_decorations(), Decorations::Client { .. });
+        let control = |id: &'static str, label: &'static str| {
+            div()
+                .id(id)
+                .w(px(32.))
+                .h(px(32.))
+                .rounded_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_lg()
+                .bg(rgb(p.sidebar))
+                .hover(move |d| d.bg(rgb(p.hover)))
+                .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                    window.prevent_default();
+                    cx.stop_propagation();
+                })
+                .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(label)
+        };
+        div()
+            .id("client-titlebar")
+            .h(px(48.))
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .justify_between()
+            .px_3()
+            .bg(rgb(p.surface))
+            .border_b_1()
+            .border_color(rgb(p.border))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, _| this.title_drag = true),
+            )
+            .on_mouse_down_out(cx.listener(|this, _, _, _| this.title_drag = false))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                    this.title_drag = false;
+                    if event.click_count == 2 {
+                        window.zoom_window();
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_move(cx.listener(|this, _, window, _| {
+                if this.title_drag {
+                    this.title_drag = false;
+                    window.start_window_move();
+                }
+            }))
+            .on_mouse_down(MouseButton::Right, |event, window, _| {
+                window.show_window_menu(event.position)
+            })
+            .child(
+                div()
+                    .w(px(240.))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        button(p, "settings", "设置")
+                            .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                                window.prevent_default();
+                                cx.stop_propagation();
+                            })
+                            .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.open_settings(window, cx);
+                            })),
+                    )
+                    .child(
+                        button(p, "appearance", self.appearance.label())
+                            .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                                window.prevent_default();
+                                cx.stop_propagation();
+                            })
+                            .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.appearance = this.appearance.next();
+                                this.appearance.apply(window, cx);
+                                apply_fonts(&this.settings, cx);
+                                if this.appearance.save().is_err() {
+                                    this.notice = "外观已切换，但无法保存偏好设置".into();
+                                }
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(APP_NAME),
+            )
+            .child(
+                div()
+                    .w(px(200.))
+                    .when(!client_decorated, |d| d.invisible())
+                    .flex()
+                    .justify_end()
+                    .gap_2()
+                    .child(control("window-minimize", "−").on_click(|_, window, cx| {
+                        cx.stop_propagation();
+                        window.minimize_window();
+                    }))
+                    .child(
+                        control(
+                            "window-maximize",
+                            if window.is_maximized() { "▣" } else { "□" },
+                        )
+                        .on_click(|_, window, cx| {
+                            cx.stop_propagation();
+                            window.zoom_window();
+                        }),
+                    )
+                    .child(control("window-close", "×").on_click(|_, window, cx| {
+                        cx.stop_propagation();
+                        window.remove_window();
+                    })),
+            )
+            .into_any_element()
+    }
+
+    fn page_toolbar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let p = Palette::current(cx);
+        let loading = self.navigation.loading();
+        let current = self.navigation.current();
+        let total = self.navigation.total();
+        let range = self.navigation.range();
+        let before = self.navigation.before();
+        let after = self.navigation.after();
+        div()
+            .flex_shrink_0()
+            .px_4()
+            .pb_2()
+            .border_b_1()
+            .border_color(rgb(p.border))
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        button(p, "previous-page", "上一页")
+                            .when(loading || current <= 1, |d| d.opacity(0.4))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if this.navigation.current() > 1 {
+                                    this.request_page(
+                                        this.navigation.current() - 1,
+                                        PageMode::Navigate,
+                                        cx,
+                                    );
+                                }
+                            })),
+                    )
+                    .child(div().text_xs().child(if current == 0 {
+                        "— / — 页".to_string()
+                    } else {
+                        format!("{current} / {total} 页")
+                    }))
+                    .child(
+                        button(p, "next-page", "下一页")
+                            .when(loading || current == 0 || current >= total, |d| {
+                                d.opacity(0.4)
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if this.navigation.current() > 0 {
+                                    this.request_page(
+                                        this.navigation.current().saturating_add(1),
+                                        PageMode::Navigate,
+                                        cx,
+                                    );
+                                }
+                            })),
+                    )
+                    .child(
+                        div()
+                            .w(px(72.))
+                            .child(Input::new(&self.page_input).disabled(loading || current == 0)),
+                    )
+                    .child(
+                        button(p, "go-page", "跳转")
+                            .when(loading || current == 0, |d| d.opacity(0.4))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if this.navigation.current() > 0 {
+                                    this.jump_to_page(cx);
+                                }
+                            })),
+                    )
+                    .when(loading, |d| {
+                        d.child(div().text_xs().text_color(rgb(p.muted)).child("加载中…"))
+                    }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div().text_xs().text_color(rgb(p.muted)).child(
+                            range
+                                .map(|(first, last)| {
+                                    format!("已加载 {first}–{last} 页 · 跳转后从目标页重新聚合")
+                                })
+                                .unwrap_or_else(|| "尚未加载页面".into()),
+                        ),
+                    )
+                    .when(self.aggregate, |d| {
+                        d.child(
+                            button(p, "buffer-before", "向前缓冲 1 页")
+                                .when(loading || before.is_none(), |d| d.opacity(0.4))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if let Some(page) = this.navigation.before() {
+                                        this.request_page(page, PageMode::Buffer, cx);
+                                    }
+                                })),
+                        )
+                        .child(
+                            button(p, "buffer-after", "向后缓冲 1 页")
+                                .when(loading || after.is_none(), |d| d.opacity(0.4))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if let Some(page) = this.navigation.after() {
+                                        this.request_page(page, PageMode::Buffer, cx);
+                                    }
+                                })),
+                        )
+                    }),
+            )
+            .into_any_element()
+    }
+
+    fn rows(&self) -> Vec<(u64, usize)> {
+        let Some(tree) = &self.tree else {
+            return vec![];
+        };
+        if !self.aggregate {
+            return self
+                .navigation
+                .linear_ids()
+                .into_iter()
+                .map(|id| (id, 0))
+                .collect();
+        }
+        let mut rows = vec![];
+        let mut stack: Vec<_> = tree
+            .nodes
+            .iter()
+            .filter(|(_, n)| n.parent.is_none())
+            .map(|(id, _)| (*id, 0))
+            .rev()
+            .collect();
+        let mut seen = HashSet::new();
+        while let Some((id, depth)) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            rows.push((id, depth));
+            if !self.collapsed.contains(&id)
+                && let Some(node) = tree.nodes.get(&id)
+            {
+                stack.extend(node.children.iter().rev().map(|id| (*id, depth + 1)));
+            }
+        }
+        rows
+    }
+}
+
+fn apply_fonts(settings: &Settings, cx: &mut App) {
+    let theme = gpui_component::Theme::global_mut(cx);
+    theme.font_family = settings.font_family.clone().into();
+    theme.font_size = px(settings.ui_font_size);
+}
+
+fn button(p: Palette, id: impl Into<ElementId>, label: impl Into<SharedString>) -> Stateful<Div> {
+    div()
+        .id(id)
+        .px_3()
+        .py_2()
+        .rounded_md()
+        .text_xs()
+        .text_color(rgb(p.accent))
+        .cursor_pointer()
+        .hover(move |d| d.bg(rgb(p.hover)))
+        .child(label.into())
+}
+fn heading(p: Palette, kicker: &str, title: String) -> Div {
+    div()
+        .p_5()
+        .border_b_1()
+        .border_color(rgb(p.border))
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(p.muted))
+                .child(kicker.to_string()),
+        )
+        .child(
+            div()
+                .mt_2()
+                .text_lg()
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(title),
+        )
+}
+
+impl Render for Island {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.install_preview_shortcuts(window, cx);
+        let p = Palette::current(cx);
+        if self.clear_draft {
+            self.attachment = None;
+            self.attachment_loading = false;
+            self.attachment_revision += 1;
+            self.body
+                .update(cx, |input, cx| input.set_value("", window, cx));
+            self.title
+                .update(cx, |input, cx| input.set_value("", window, cx));
+            self.clear_draft = false;
+        }
+        let mut forums = div()
+            .id("forums-scroll")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .px_3();
+        for group in &self.groups {
+            forums = forums.child(
+                div()
+                    .px_3()
+                    .pt_5()
+                    .pb_2()
+                    .text_xs()
+                    .text_color(rgb(p.muted))
+                    .child(group.name.clone()),
+            );
+            for forum in &group.forums {
+                if forum.id < 0 {
+                    continue;
+                }
+                let id = forum.id;
+                let name = forum.display_name();
+                forums =
+                    forums.child(
+                        button(p, ("forum", id as u64), name.clone())
+                            .w_full()
+                            .mb_1()
+                            .when(!self.showing_subscriptions && self.forum == id, |d| {
+                                d.bg(rgb(p.selected)).font_weight(FontWeight::SEMIBOLD)
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.load_forum(id, name.clone(), cx)
+                            })),
+                    );
+            }
+        }
+        let sidebar = div()
+            .w_full()
+            .min_w_0()
+            .h_full()
+            .flex()
+            .flex_col()
+            .bg(rgb(p.sidebar))
+            .child(heading(p, "N M B X D", APP_NAME.into()))
+            .child(
+                button(p, "subscriptions", "☆ 我的订阅")
+                    .mx_3()
+                    .mb_2()
+                    .when(self.showing_subscriptions, |d| d.bg(rgb(p.selected)))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if !this.showing_subscriptions || !this.forum_loading {
+                            this.load_subscriptions(cx);
+                        }
+                    })),
+            )
+            .child(forums)
+            .child(
+                button(p, "reconnect", "重新获取板块").on_click(cx.listener(|this, _, _, _| {
+                    if !this.groups_loading {
+                        this.groups_loading = true;
+                        this.tx.send(Request::Forums).ok();
+                    }
+                })),
+            )
+            .child(
+                div()
+                    .p_4()
+                    .text_xs()
+                    .text_color(rgb(p.muted))
+                    .child(if self.cookie {
+                        "● 本地饼干已载入"
+                    } else {
+                        "○ 只读浏览"
+                    }),
+            );
+        let mut list = div()
+            .id(("threads-scroll", self.forum_epoch))
+            .track_scroll(&self.forum_scroll)
+            .on_scroll_wheel(cx.listener(Self::scroll_forum))
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .p_3();
+        for post in &self.threads {
+            let id = post.id;
+            let subscription_view = cx.entity().downgrade();
+            let preview: String = post
+                .text()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .chars()
+                .take(100)
+                .collect();
+            list = list.child(
+                div()
+                    .id(("thread", id))
+                    .p_4()
+                    .mb_2()
+                    .rounded_lg()
+                    .cursor_pointer()
+                    .bg(rgb(if self.selected == Some(id) {
+                        p.selected
+                    } else {
+                        p.surface
+                    }))
+                    .hover(move |d| d.bg(rgb(p.hover)))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(p.muted))
+                            .child(format!("No.{}  ·  {} 回复", id, post.reply_count)),
+                    )
+                    .child(
+                        div()
+                            .mt_2()
+                            .text_size(px(self.settings.thread_font_size))
+                            .child(preview),
+                    )
+                    .when_some(post.image_url(true), |d, url| {
+                        d.child(div().mt_2().child(media_view::tile(
+                            &self.media,
+                            url,
+                            px(110.),
+                            cx,
+                        )))
+                    })
+                    .when(self.showing_subscriptions, |d| {
+                        d.child(
+                            button(
+                                p,
+                                ("remove-subscription", id),
+                                if self.subscription_pending.contains(&id) {
+                                    "处理中…"
+                                } else {
+                                    "移除订阅"
+                                },
+                            )
+                            .mt_2()
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.change_subscription(id, false, cx);
+                                },
+                            )),
+                        )
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| this.open_thread(id, cx)))
+                    .context_menu(move |menu, _, cx| {
+                        let Some(view) = subscription_view.upgrade() else {
+                            return menu;
+                        };
+                        let state = view.read(cx);
+                        let add = !state.subscribed.contains(&id);
+                        let pending = state.subscription_pending.contains(&id);
+                        menu.item(
+                            PopupMenuItem::new(if add { "添加订阅" } else { "移除订阅" })
+                                .disabled(pending)
+                                .on_click(move |_, _, cx| {
+                                    view.update(cx, |this, cx| {
+                                        this.change_subscription(id, add, cx)
+                                    })
+                                }),
+                        )
+                    }),
+            );
+        }
+        list = list.child(
+            div()
+                .py_3()
+                .text_xs()
+                .text_center()
+                .text_color(rgb(p.muted))
+                .child(if self.forum_loading {
+                    "正在加载…"
+                } else if self.forum_end {
+                    if self.showing_subscriptions {
+                        "已到订阅列表末尾"
+                    } else {
+                        "已到板块末尾"
+                    }
+                } else if self.forum_paging.failed {
+                    "加载失败，当前内容已保留"
+                } else {
+                    "滑到底部自动加载下一页"
+                })
+                .when(
+                    !self.forum_loading
+                        && (self.forum_end
+                            || self.forum_paging.failed
+                            || self.forum_scroll.max_offset().height <= px(2.)),
+                    |d| {
+                        d.child(
+                            button(
+                                p,
+                                "more-threads",
+                                if self.forum_end {
+                                    "重新检查下一页"
+                                } else if self.forum_paging.failed {
+                                    "重试加载"
+                                } else {
+                                    "手动加载下一页"
+                                },
+                            )
+                            .mt_2()
+                            .w_full()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.forum_paging.retry();
+                                this.forum_end = false;
+                                this.request_forum_next(cx);
+                            })),
+                        )
+                    },
+                ),
+        );
+        let thread_list = div()
+            .w_full()
+            .min_w_0()
+            .h_full()
+            .flex()
+            .flex_col()
+            .border_r_1()
+            .border_color(rgb(p.border))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .border_b_1()
+                    .border_color(rgb(p.border))
+                    .child(div().flex_1().min_w_0().child(heading(
+                        p,
+                        if self.showing_subscriptions {
+                            "FEED / 订阅"
+                        } else {
+                            "BOARD / 板块"
+                        },
+                        if self.showing_subscriptions {
+                            "我的订阅".into()
+                        } else {
+                            self.forum_name.clone()
+                        },
+                    )))
+                    .child(
+                        button(
+                            p,
+                            "refresh-forum",
+                            if self.forum_loading {
+                                "加载中…"
+                            } else {
+                                "刷新"
+                            },
+                        )
+                        .mr_2()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if !this.forum_loading {
+                                if this.showing_subscriptions {
+                                    this.load_subscriptions(cx);
+                                } else {
+                                    this.load_forum(this.forum, this.forum_name.clone(), cx);
+                                }
+                            }
+                        })),
+                    ),
+            )
+            .child(
+                button(
+                    p,
+                    "new-thread",
+                    if self.showing_subscriptions {
+                        "＋ 发串到当前板块"
+                    } else {
+                        "＋ 发起新串"
+                    },
+                )
+                .mx_3()
+                .mt_2()
+                .on_click(cx.listener(|this, _, window, cx| this.compose(None, None, window, cx))),
+            )
+            .child(list);
+        let mut reading = div()
+            .id(("reading-scroll", self.reading_revision))
+            .track_scroll(&self.reading_scroll)
+            .on_scroll_wheel(cx.listener(Self::scroll_reading))
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .p_5();
+        if self.selected.is_none() {
+            reading = reading.child(
+                div()
+                    .mt_20()
+                    .text_center()
+                    .text_color(rgb(p.muted))
+                    .child("在左侧选一篇串\n把喧嚣留在外面，慢慢读。"),
+            );
+        }
+        for (id, depth) in self.rows() {
+            if let Some(node) = self.tree.as_ref().and_then(|tree| tree.nodes.get(&id)) {
+                reading = reading.child(self.post_card(
+                    &node.post,
+                    depth,
+                    &node.missing_references,
+                    !node.children.is_empty(),
+                    cx,
+                ));
+            }
+        }
+        if self.selected.is_some() {
+            let end = self.reading_next().is_none();
+            reading = reading.child(
+                div()
+                    .py_3()
+                    .text_xs()
+                    .text_center()
+                    .text_color(rgb(p.muted))
+                    .child(if self.navigation.loading() {
+                        "正在加载…"
+                    } else if self.reading_paging.failed {
+                        "加载失败，当前内容已保留"
+                    } else if end {
+                        "已到当前最后一页"
+                    } else {
+                        "滑到底部自动加载下一页"
+                    })
+                    .when(
+                        !self.navigation.loading()
+                            && (end
+                                || self.reading_paging.failed
+                                || self.reading_scroll.max_offset().height <= px(2.)),
+                        |d| {
+                            d.child(
+                                button(
+                                    p,
+                                    "more-replies",
+                                    if self.reading_paging.failed {
+                                        "重试加载"
+                                    } else if end {
+                                        "刷新，检查新回复"
+                                    } else {
+                                        "手动加载下一页"
+                                    },
+                                )
+                                .mt_2()
+                                .w_full()
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        this.reading_paging.retry();
+                                        let request =
+                                            this.reading_retry.or_else(|| this.reading_next());
+                                        if let Some((page, mode)) = request {
+                                            this.request_page(page, mode, cx);
+                                        } else {
+                                            let page = if this.aggregate {
+                                                this.navigation
+                                                    .range()
+                                                    .map(|(_, last)| last)
+                                                    .unwrap_or(1)
+                                            } else {
+                                                this.navigation.current().max(1)
+                                            };
+                                            this.request_page(page, PageMode::Recheck, cx);
+                                        }
+                                    },
+                                )),
+                            )
+                        },
+                    ),
+            );
+        }
+        let reader = div()
+            .w_full()
+            .min_w_0()
+            .h_full()
+            .flex()
+            .flex_col()
+            .child(heading(
+                p,
+                "THREAD / 阅读",
+                self.selected
+                    .map(|id| format!("No.{id}"))
+                    .unwrap_or("此刻，岛上".into()),
+            ))
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .px_4()
+                    .py_2()
+                    .gap_2()
+                    .child(
+                        button(p, "chronological", "时间顺序")
+                            .when(!self.aggregate, |d| d.bg(rgb(p.selected)))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if this.aggregate {
+                                    this.aggregate = false;
+                                    this.reset_reading_scroll();
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .when(self.selected.is_some(), |d| {
+                        d.child(button(p, "refresh-thread", "刷新").on_click(cx.listener(
+                            |this, _, _, cx| {
+                                this.request_page(1, PageMode::Refresh, cx);
+                            },
+                        )))
+                    })
+                    .child(
+                        button(p, "aggregate", "引用树")
+                            .when(self.aggregate, |d| d.bg(rgb(p.selected)))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if !this.aggregate {
+                                    this.aggregate = true;
+                                    this.reset_reading_scroll();
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .when_some(self.selected, |d, id| {
+                        d.child(self.subscription_button(id, cx))
+                    })
+                    .when(self.selected.is_some(), |d| {
+                        d.child(button(p, "reply", "＋ 回复").on_click(cx.listener(
+                            |this, _, window, cx| this.compose(this.selected, None, window, cx),
+                        )))
+                    }),
+            )
+            .when(self.selected.is_some(), |d| d.child(self.page_toolbar(cx)))
+            .child(reading)
+            .with_animation(
+                ("reader-enter", self.thread_epoch),
+                Animation::new(Duration::from_millis(220)).with_easing(ease_out_quint()),
+                |d, delta| d.opacity(0.3 + 0.7 * delta),
+            );
+        let editor = if self.composing {
+            let editor = div()
+                .capture_action(
+                    cx.listener(|this, _: &gpui_component::input::Paste, _, cx| {
+                        if this.paste_image(false, cx) {
+                            cx.stop_propagation();
+                        }
+                    }),
+                )
+                .w_full()
+                .min_w_0()
+                .h_full()
+                .flex()
+                .flex_col()
+                .bg(rgb(p.surface))
+                .border_l_1()
+                .border_color(rgb(p.border))
+                .child(heading(p, "WRITE / 写点什么", self.compose_label.clone()))
+                .child(
+                    div()
+                        .p_4()
+                        .child(Input::new(&self.title).disabled(self.sending)),
+                )
+                .child(
+                    div().px_4().flex_1().min_h_0().child(
+                        Input::new(&self.body)
+                            .disabled(self.sending)
+                            .text_size(px(self.settings.body_font_size))
+                            .h_full(),
+                    ),
+                )
+                .child(
+                    div()
+                        .px_4()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .child(
+                            button(
+                                p,
+                                "choose-image",
+                                if self.attachment_loading {
+                                    "正在读取…"
+                                } else {
+                                    "选择图片"
+                                },
+                            )
+                            .when(self.sending || self.attachment_loading, |d| d.opacity(0.4))
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.choose_image(window, cx)),
+                            ),
+                        )
+                        .child(
+                            button(p, "paste-image", "粘贴图片")
+                                .when(self.sending || self.attachment_loading, |d| d.opacity(0.4))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.paste_image(true, cx);
+                                })),
+                        ),
+                )
+                .when_some(self.attachment.as_ref(), |d, image| {
+                    d.child(
+                        div()
+                            .px_4()
+                            .py_2()
+                            .child(
+                                img(image.preview.clone())
+                                    .w_full()
+                                    .h(px(96.))
+                                    .object_fit(ObjectFit::Contain),
+                            )
+                            .child(div().text_xs().text_color(rgb(p.muted)).child(format!(
+                                "{} · {:.1} KiB",
+                                image.attachment.filename(),
+                                image.attachment.size() as f64 / 1024.
+                            )))
+                            .child(button(p, "remove-attachment", "移除图片").on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    if !this.sending {
+                                        this.attachment = None;
+                                        this.attachment_revision += 1;
+                                        this.attachment_loading = false;
+                                        cx.notify();
+                                    }
+                                }),
+                            )),
+                    )
+                })
+                .child(
+                    button(p, "clear-draft", "清空草稿")
+                        .mx_4()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if !this.sending {
+                                this.clear_draft = true;
+                                cx.notify();
+                            }
+                        })),
+                )
+                .child(
+                    div()
+                        .p_4()
+                        .text_xs()
+                        .text_color(rgb(p.muted))
+                        .child("友善交流，认真生活。\n发送前请检查目标与内容。"),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .p_4()
+                        .justify_between()
+                        .child(
+                            button(p, "close-editor", "收起 / 保留草稿").on_click(cx.listener(
+                                |this, _, _, cx| {
+                                    if !this.sending {
+                                        this.composing = false;
+                                        cx.notify();
+                                    }
+                                },
+                            )),
+                        )
+                        .child(
+                            button(
+                                p,
+                                "send",
+                                if self.sending {
+                                    "发送中…"
+                                } else if !self.cookie {
+                                    "需要饼干"
+                                } else {
+                                    "发送 ↗"
+                                },
+                            )
+                            .bg(rgb(p.selected))
+                            .on_click(cx.listener(|this, _, _, cx| this.send(cx))),
+                        ),
+                )
+                .with_animation(
+                    ("editor-enter", self.animation),
+                    Animation::new(Duration::from_millis(240)).with_easing(ease_out_quint()),
+                    |d, delta| d.opacity(delta),
+                );
+            Some(editor.into_any_element())
+        } else {
+            None
+        };
+        let columns = self.panes.render(
+            sidebar.into_any_element(),
+            thread_list.into_any_element(),
+            reader.into_any_element(),
+            editor,
+            window,
+            cx,
+        );
+        div()
+            .capture_any_mouse_down(cx.listener(Self::preview_mouse_down))
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(rgb(p.background))
+            .text_color(rgb(p.foreground))
+            .font_family(self.settings.font_family.clone())
+            .text_size(px(self.settings.ui_font_size))
+            .child(self.header(window, cx))
+            .child(if let Some(panel) = &self.settings_panel {
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .p_4()
+                    .child(panel.clone())
+                    .into_any_element()
+            } else if let Some(url) = &self.viewing_image {
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .p_4()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(div().text_sm().child("原图 · 动图暂显示首帧"))
+                            .child(button(p, "close-image", "关闭原图").on_click(cx.listener(
+                                |this, _, _, cx| {
+                                    this.viewing_image = None;
+                                    cx.notify();
+                                },
+                            ))),
+                    )
+                    .child(media_view::tile(
+                        &self.media,
+                        url.clone(),
+                        (window.viewport_size().height - px(180.)).max(px(200.)),
+                        cx,
+                    ))
+                    .into_any_element()
+            } else {
+                columns.into_any_element()
+            })
+            .child(
+                div()
+                    .h(px(32.))
+                    .flex_shrink_0()
+                    .px_4()
+                    .flex()
+                    .items_center()
+                    .text_xs()
+                    .text_color(rgb(p.muted))
+                    .border_t_1()
+                    .border_color(rgb(p.border))
+                    .child(self.notice.clone()),
+            )
+            .relative()
+            .when(!self.previews.is_empty(), |d| {
+                d.child(self.preview_overlay(cx))
+            })
+    }
+}
+
+fn main() -> anyhow::Result<()> {
+    dotenvy::dotenv().ok();
+    let cookie = ["NMBXD_COOKIE", "userhash", "usrhash"]
+        .iter()
+        .find_map(|key| std::env::var(key).ok())
+        .filter(|s| !s.trim().is_empty());
+    let settings = Settings::load_or_initialize(cookie.unwrap_or_default())?;
+    let api = ApiClient::with_website_base(Some(&settings.cookie), &settings.website_base)?;
+    if std::env::args().any(|arg| arg == "--smoke") {
+        let groups = api.forum_groups()?;
+        std::thread::sleep(Duration::from_millis(800));
+        let posts = api.forum_page(4, 1)?;
+        println!(
+            "Read-only API smoke: {} forum groups, {} threads",
+            groups.len(),
+            posts.len()
+        );
+        if let Some(post) = posts.first() {
+            std::thread::sleep(Duration::from_millis(800));
+            let thread = api.thread_page(post.id, 1)?;
+            println!("Thread page: {} replies", thread.replies.len());
+        }
+        return Ok(());
+    }
+    Application::new()
+        .with_assets(assets::Assets)
+        .run(move |cx: &mut App| {
+            emoji::init(cx).expect("Unable to load bundled emoji font");
+            gpui_component::init(cx);
+            cx.on_window_closed(|cx| {
+                if cx.windows().is_empty() {
+                    cx.quit();
+                }
+            })
+            .detach();
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+                        None,
+                        size(px(1400.), px(900.)),
+                        cx,
+                    ))),
+                    app_id: Some("io.github.nmbxd.Dawn".into()),
+                    window_decorations: Some(WindowDecorations::Client),
+                    window_background: WindowBackgroundAppearance::Transparent,
+                    window_min_size: Some(size(px(1100.), px(640.))),
+                    titlebar: Some(TitlebarOptions {
+                        title: Some(APP_NAME.into()),
+                        appears_transparent: true,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                |window, cx| {
+                    let view = cx.new(|cx| Island::new(window, cx, api, settings));
+                    cx.new(|cx| Root::new(view, window, cx))
+                },
+            )
+            .expect("Unable to create window");
+            cx.activate(true);
+        });
+    Ok(())
+}

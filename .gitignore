@@ -1,0 +1,12 @@
+/target
+.env
+.env.*
+!.env.example
+
+/dist
+
+# Local agent / credential configuration
+/.agents
+/.codex
+/.aws
+/settings.json
