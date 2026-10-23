@@ -1523,77 +1523,85 @@ impl Render for Island {
                 .chars()
                 .take(100)
                 .collect();
+            // ContextMenuExt uses a fixed element ID. Scope the wrapper itself
+            // per thread, otherwise every row shares and paints the same menu.
             list = list.child(
-                div()
-                    .id(("thread", id))
-                    .p_4()
-                    .mb_2()
-                    .rounded_lg()
-                    .cursor_pointer()
-                    .bg(rgb(if self.selected == Some(id) {
-                        p.selected
-                    } else {
-                        p.surface
-                    }))
-                    .hover(move |d| d.bg(rgb(p.hover)))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(p.muted))
-                            .child(format!("No.{}  ·  {} 回复", id, post.reply_count)),
-                    )
-                    .child(
-                        div()
-                            .mt_2()
-                            .text_size(px(self.settings.thread_font_size))
-                            .child(preview),
-                    )
-                    .when_some(post.image_url(true), |d, url| {
-                        d.child(div().mt_2().child(media_view::tile(
-                            &self.media,
-                            url,
-                            px(110.),
-                            cx,
-                        )))
-                    })
-                    .when(self.showing_subscriptions, |d| {
-                        d.child(
-                            button(
-                                p,
-                                ("remove-subscription", id),
-                                if self.subscription_pending.contains(&id) {
-                                    "处理中…"
+                div().id(("thread-context", id)).child(
+                    div()
+                        .id(("thread", id))
+                        .p_4()
+                        .mb_2()
+                        .rounded_lg()
+                        .cursor_pointer()
+                        .bg(rgb(if self.selected == Some(id) {
+                            p.selected
+                        } else {
+                            p.surface
+                        }))
+                        .hover(move |d| d.bg(rgb(p.hover)))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(p.muted))
+                                .child(format!("No.{}  ·  {} 回复", id, post.reply_count)),
+                        )
+                        .child(
+                            div()
+                                .mt_2()
+                                .text_size(px(self.settings.thread_font_size))
+                                .child(preview),
+                        )
+                        .when_some(post.image_url(true), |d, url| {
+                            d.child(div().mt_2().child(media_view::tile(
+                                &self.media,
+                                url,
+                                px(110.),
+                                cx,
+                            )))
+                        })
+                        .when(self.showing_subscriptions, |d| {
+                            d.child(
+                                button(
+                                    p,
+                                    ("remove-subscription", id),
+                                    if self.subscription_pending.contains(&id) {
+                                        "处理中…"
+                                    } else {
+                                        "移除订阅"
+                                    },
+                                )
+                                .mt_2()
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.change_subscription(id, false, cx);
+                                    },
+                                )),
+                            )
+                        })
+                        .on_click(cx.listener(move |this, _, _, cx| this.open_thread(id, cx)))
+                        .context_menu(move |menu, _, cx| {
+                            let Some(view) = subscription_view.upgrade() else {
+                                return menu;
+                            };
+                            let state = view.read(cx);
+                            let add = !state.subscribed.contains(&id);
+                            let pending = state.subscription_pending.contains(&id);
+                            menu.item(
+                                PopupMenuItem::new(if add {
+                                    "添加订阅"
                                 } else {
                                     "移除订阅"
-                                },
-                            )
-                            .mt_2()
-                            .on_click(cx.listener(
-                                move |this, _, _, cx| {
-                                    cx.stop_propagation();
-                                    this.change_subscription(id, false, cx);
-                                },
-                            )),
-                        )
-                    })
-                    .on_click(cx.listener(move |this, _, _, cx| this.open_thread(id, cx)))
-                    .context_menu(move |menu, _, cx| {
-                        let Some(view) = subscription_view.upgrade() else {
-                            return menu;
-                        };
-                        let state = view.read(cx);
-                        let add = !state.subscribed.contains(&id);
-                        let pending = state.subscription_pending.contains(&id);
-                        menu.item(
-                            PopupMenuItem::new(if add { "添加订阅" } else { "移除订阅" })
+                                })
                                 .disabled(pending)
                                 .on_click(move |_, _, cx| {
                                     view.update(cx, |this, cx| {
                                         this.change_subscription(id, add, cx)
                                     })
                                 }),
-                        )
-                    }),
+                            )
+                        }),
+                ),
             );
         }
         list = list.child(
