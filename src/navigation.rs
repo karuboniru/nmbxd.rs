@@ -53,6 +53,72 @@ pub struct Navigation {
 }
 
 impl Navigation {
+    /// Restore one contiguous cached window without partially committing bad data.
+    pub fn restore(&mut self, pages: Vec<(u32, Post)>, current: u32) -> bool {
+        let Some((_, first_post)) = pages.first() else {
+            return false;
+        };
+        let root_id = first_post.id;
+        let count = pages.len();
+        if pages
+            .iter()
+            .any(|(number, post)| *number == 0 || post.id != root_id)
+        {
+            return false;
+        }
+        let pages: BTreeMap<_, _> = pages.into_iter().collect();
+        // Reject duplicate page numbers as well as missing pages.
+        if pages.len() != count || !pages.contains_key(&current) {
+            return false;
+        }
+        let (&first, _) = pages.first_key_value().unwrap();
+        let (&last, _) = pages.last_key_value().unwrap();
+        if u64::from(last) - u64::from(first) + 1 != count as u64 {
+            return false;
+        }
+        self.total = pages
+            .values()
+            .map(|post| total_pages(post.reply_count))
+            .max()
+            .unwrap_or(1)
+            .max(last);
+        self.pages = pages;
+        self.current = current;
+        self.pending = None;
+        true
+    }
+
+    /// Permit the first request to resume beyond page one without cached data.
+    pub fn allow_resume_page(&mut self, page: u32) {
+        if self.pages.is_empty() && self.pending.is_none() {
+            self.total = self.total.max(page);
+        }
+    }
+
+    pub fn pages(&self) -> impl Iterator<Item = (u32, &Post)> {
+        self.pages.iter().map(|(&number, post)| (number, post))
+    }
+
+    /// Find the cached API page containing a visible post, including nested replies.
+    pub fn page_for_post(&self, post_id: u64) -> Option<u32> {
+        fn contains(post: &Post, id: u64) -> bool {
+            (!post.is_tip() && post.id == id)
+                || post.replies.iter().any(|reply| contains(reply, id))
+        }
+        // The root appears on every page, so prefer the current page for it and
+        // for any overlapping replies returned by the API.
+        if self
+            .pages
+            .get(&self.current)
+            .is_some_and(|post| contains(post, post_id))
+        {
+            return Some(self.current);
+        }
+        self.pages
+            .iter()
+            .find_map(|(&number, post)| contains(post, post_id).then_some(number))
+    }
+
     pub fn current(&self) -> u32 {
         self.current
     }
@@ -120,10 +186,19 @@ impl Navigation {
         let Some(post) = post else {
             return false;
         };
+        if self
+            .pages
+            .first_key_value()
+            .is_some_and(|(_, root)| root.id != post.id)
+        {
+            return false;
+        }
         if matches!(pending.mode, PageMode::Jump | PageMode::Refresh) {
             self.pages.clear();
         }
-        self.total = total_pages(post.reply_count).max(page);
+        self.total = total_pages(post.reply_count)
+            .max(page)
+            .max(self.pages.last_key_value().map_or(1, |(&number, _)| number));
         self.pages.insert(page, post);
         if !matches!(pending.mode, PageMode::Buffer | PageMode::Recheck) || self.current == 0 {
             self.current = page;
@@ -141,7 +216,7 @@ impl Navigation {
         Some(tree)
     }
 
-    /// Always put the root first, followed by this page's replies in ID order.
+    /// Keep the root first and all loaded replies in chronological ID order.
     pub fn linear_ids(&self) -> Vec<u64> {
         fn collect(post: &Post, ids: &mut BTreeSet<u64>) {
             if !post.is_tip() {
@@ -151,11 +226,13 @@ impl Navigation {
                 collect(reply, ids);
             }
         }
-        let Some(post) = self.pages.get(&self.current) else {
+        let Some((_, post)) = self.pages.first_key_value() else {
             return vec![];
         };
         let mut ids = BTreeSet::new();
-        collect(post, &mut ids);
+        for page in self.pages.values() {
+            collect(page, &mut ids);
+        }
         ids.remove(&post.id);
         std::iter::once(post.id).chain(ids).collect()
     }
@@ -195,6 +272,92 @@ mod tests {
     }
 
     #[test]
+    fn restore_rebuilds_window_and_resumes_normal_requests() {
+        let mut nav = Navigation::default();
+        assert_eq!(nav.request(1, PageMode::Navigate), PageAction::Fetch);
+        assert!(nav.restore(vec![(8, page(8)), (7, page(7)), (9, page(9))], 8));
+        assert!(!nav.loading());
+        assert_eq!(nav.range(), Some((7, 9)));
+        assert_eq!(nav.current(), 8);
+        assert_eq!(nav.total(), 10);
+        assert_eq!(nav.page_for_post(100), Some(8));
+        assert_eq!(nav.page_for_post(107), Some(7));
+        assert_eq!(nav.page_for_post(999), None);
+        assert_eq!(
+            nav.pages().map(|(number, _)| number).collect::<Vec<_>>(),
+            vec![7, 8, 9]
+        );
+        assert_eq!(nav.request(4, PageMode::Navigate), PageAction::Ignored);
+        load(&mut nav, 10, PageMode::Buffer);
+        assert_eq!(nav.current(), 8);
+        assert_eq!(nav.request(7, PageMode::Navigate), PageAction::Cached);
+        assert_eq!(nav.current(), 7);
+        assert_eq!(nav.request(2, PageMode::Jump), PageAction::Fetch);
+        assert!(!nav.receive(2, None));
+        assert_eq!(nav.range(), Some((7, 10)));
+    }
+
+    #[test]
+    fn invalid_restore_is_atomic_and_never_merges_gaps_or_threads() {
+        let mut wrong_root = page(8);
+        wrong_root.id = 200;
+        let invalid = [
+            (vec![], 1),
+            (vec![(0, page(1))], 0),
+            (vec![(7, page(7)), (9, page(9))], 7),
+            (vec![(7, page(7)), (7, page(7))], 7),
+            (vec![(7, page(7)), (8, wrong_root)], 7),
+            (vec![(7, page(7)), (8, page(8))], 6),
+        ];
+        for (pages, current) in invalid {
+            let mut nav = Navigation::default();
+            load(&mut nav, 1, PageMode::Navigate);
+            assert_eq!(nav.request(2, PageMode::Navigate), PageAction::Fetch);
+            assert!(!nav.restore(pages, current));
+            assert_eq!(nav.range(), Some((1, 1)));
+            assert_eq!(nav.current(), 1);
+            assert_eq!(nav.total(), 10);
+            assert!(nav.loading());
+            assert!(nav.receive(2, Some(page(2))));
+        }
+    }
+
+    #[test]
+    fn resume_without_cache_allows_initial_later_page_only_before_loading() {
+        let mut nav = Navigation::default();
+        assert_eq!(nav.request(8, PageMode::Navigate), PageAction::Ignored);
+        nav.allow_resume_page(8);
+        assert_eq!(nav.request(8, PageMode::Navigate), PageAction::Fetch);
+        nav.allow_resume_page(20);
+        assert_eq!(nav.total(), 8);
+        assert!(nav.receive(8, Some(page(8))));
+        nav.allow_resume_page(20);
+        assert_eq!(nav.total(), 10);
+        assert_eq!(nav.current(), 8);
+        assert_eq!(nav.range(), Some((8, 8)));
+    }
+
+    #[test]
+    fn restored_window_rejects_other_threads_and_keeps_total_above_cached_pages() {
+        let mut nav = Navigation::default();
+        let mut stale = page(9);
+        stale.reply_count = 1;
+        assert!(nav.restore(vec![(8, page(8)), (9, stale)], 8));
+        assert_eq!(nav.request(8, PageMode::Recheck), PageAction::Fetch);
+        let mut wrong = page(8);
+        wrong.id = 200;
+        assert!(!nav.receive(8, Some(wrong)));
+        assert_eq!(nav.range(), Some((8, 9)));
+        assert!(!nav.loading());
+        assert_eq!(nav.request(8, PageMode::Recheck), PageAction::Fetch);
+        let mut stale = page(8);
+        stale.reply_count = 1;
+        assert!(nav.receive(8, Some(stale)));
+        assert_eq!(nav.total(), 9);
+        assert_eq!(nav.range(), Some((8, 9)));
+    }
+
+    #[test]
     fn jumping_replaces_subset_only_after_success_and_buffers_are_explicit() {
         let mut nav = Navigation::default();
         load(&mut nav, 1, PageMode::Navigate);
@@ -211,7 +374,7 @@ mod tests {
         load(&mut nav, 9, PageMode::Buffer);
         assert_eq!(nav.range(), Some((7, 9)));
         assert_eq!(nav.current(), 8);
-        assert_eq!(nav.linear_ids(), vec![100, 108]);
+        assert_eq!(nav.linear_ids(), vec![100, 107, 108, 109]);
         assert_eq!(nav.tree().unwrap().loaded_pages, BTreeSet::from([7, 8, 9]));
         assert_eq!(nav.request(7, PageMode::Navigate), PageAction::Cached);
         assert!(!nav.loading());
@@ -258,6 +421,35 @@ mod tests {
         nav.receive(1, Some(post));
         assert_eq!(nav.linear_ids(), vec![100, 50, 101]);
         assert_eq!(nav.tree().unwrap().nodes.len(), 3);
+    }
+
+    #[test]
+    fn linear_rows_append_and_prepend_all_loaded_pages_without_duplicates() {
+        let mut nav = Navigation::default();
+        nav.allow_resume_page(2);
+        load(&mut nav, 2, PageMode::Navigate);
+        assert_eq!(nav.linear_ids(), vec![100, 102]);
+        load(&mut nav, 3, PageMode::Navigate);
+        assert_eq!(nav.linear_ids(), vec![100, 102, 103]);
+        load(&mut nav, 1, PageMode::Buffer);
+        assert_eq!(nav.current(), 3);
+        assert_eq!(nav.linear_ids(), vec![100, 101, 102, 103]);
+        assert_eq!(nav.request(4, PageMode::Buffer), PageAction::Fetch);
+        let mut fourth = page(4);
+        fourth.replies.extend([
+            page(1).replies.remove(0),
+            Post {
+                id: 9_999_999,
+                user_hash: "Tips".into(),
+                ..Post::default()
+            },
+        ]);
+        assert!(nav.receive(4, Some(fourth)));
+        assert_eq!(nav.linear_ids(), vec![100, 101, 102, 103, 104]);
+        assert_eq!(nav.request(2, PageMode::Navigate), PageAction::Cached);
+        assert_eq!(nav.linear_ids(), vec![100, 101, 102, 103, 104]);
+        assert_eq!(nav.request(2, PageMode::Jump), PageAction::Cached);
+        assert_eq!(nav.linear_ids(), vec![100, 102]);
     }
 
     #[test]

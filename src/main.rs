@@ -6,6 +6,8 @@ mod attachments;
 mod config_paths;
 mod drafts;
 mod emoji;
+mod history_controller;
+mod history_view;
 mod image_actions;
 mod image_clipboard;
 mod image_export;
@@ -32,6 +34,7 @@ use navigation::{Navigation, PageAction, PageMode, parse_page};
 use rdnmb::{
     APP_ID, APP_NAME,
     api::ApiClient,
+    history::{HistoryCategory, HistoryEntry, HistoryStore, PostingEntry, ReadingPosition},
     model::{ForumGroup, Post},
     tree::ThreadTree,
 };
@@ -64,7 +67,7 @@ enum Response {
     Forums(Result<Vec<ForumGroup>, String>),
     Forum(u64, u32, Result<Vec<Post>, String>),
     Thread(u64, u32, Result<Post, String>),
-    Sent(Result<String, String>),
+    Sent(Result<String, String>, Option<String>),
 }
 
 struct ComposerDraft {
@@ -74,6 +77,16 @@ struct ComposerDraft {
 }
 
 struct Island {
+    history: Option<HistoryStore>,
+    showing_history: bool,
+    history_category: HistoryCategory,
+    history_entries: Vec<HistoryEntry>,
+    history_offset: u32,
+    history_has_more: bool,
+    history_scroll: ScrollHandle,
+    reading_restore: Option<ReadingPosition>,
+    restore_scheduled: bool,
+    position_save_revision: u64,
     drafts: drafts::Drafts<ComposerDraft>,
     image_export_busy: bool,
     content_views: std::cell::RefCell<
@@ -156,6 +169,21 @@ impl Island {
             }
         })
         .detach();
+        let (history, history_error) = match config_paths::paths("history.sqlite3") {
+            Some((path, _)) => match HistoryStore::open(&path) {
+                Ok(store) => (Some(store), None),
+                Err(error) => (None, Some(format!("本地历史不可用：{error}"))),
+            },
+            None => (None, Some("无法确定本地历史目录".to_owned())),
+        };
+        cx.on_release(|this, _| this.save_reading_position())
+            .detach();
+        cx.on_app_quit(|this, _| {
+            this.save_reading_position();
+            async {}
+        })
+        .detach();
+        let posting_history = history.clone();
         let cookie = api.has_cookie();
         let (tx, rx) = mpsc::channel();
         let (out, incoming) = mpsc::channel();
@@ -215,15 +243,38 @@ impl Island {
                         page,
                         api.thread_page(id, page).map_err(|e| e.to_string()),
                     ),
-                    Request::Send(target, fid, title, body, image) => Response::Sent(
-                        match target {
+                    Request::Send(target, fid, title, body, image) => {
+                        let result = match target {
                             Some(id) => api.reply_with_image(id, "", &title, &body, image.as_ref()),
                             None => {
                                 api.post_thread_with_image(fid, "", &title, &body, image.as_ref())
                             }
                         }
-                        .map_err(|e| e.to_string()),
-                    ),
+                        .map_err(|e| e.to_string());
+                        // Capture the exact submitted draft, not the current editor state.
+                        let history_error = if let Ok(message) = &result {
+                            if let Some(store) = &posting_history {
+                                store
+                                    .record_post(&PostingEntry {
+                                        id: 0,
+                                        target,
+                                        forum_id: fid,
+                                        title,
+                                        body,
+                                        has_image: image.is_some(),
+                                        sent_at: rdnmb::history::now_millis(),
+                                        message: message.clone(),
+                                    })
+                                    .err()
+                                    .map(|error| error.to_string())
+                            } else {
+                                Some("本地历史不可用".into())
+                            }
+                        } else {
+                            None
+                        };
+                        Response::Sent(result, history_error)
+                    }
                 };
                 if out.send(result).is_err() {
                     break;
@@ -267,6 +318,16 @@ impl Island {
         let media = cx.new(|_| media::MediaStore::new());
         cx.observe(&media, |_, _, cx| cx.notify()).detach();
         Self {
+            history,
+            showing_history: false,
+            history_category: HistoryCategory::Browsing,
+            history_entries: Vec::new(),
+            history_offset: 0,
+            history_has_more: false,
+            history_scroll: ScrollHandle::new(),
+            reading_restore: None,
+            restore_scheduled: false,
+            position_save_revision: 0,
             image_export_busy: false,
             content_views: Default::default(),
             preview_shortcut_subscription: None,
@@ -326,7 +387,7 @@ impl Island {
             attachment_loading: false,
             attachment_revision: 0,
             cookie,
-            notice: "正在连接岛屿…".into(),
+            notice: history_error.unwrap_or_else(|| "正在连接岛屿…".into()),
         }
     }
 
@@ -369,7 +430,10 @@ impl Island {
                 match result {
                     Ok(groups) => {
                         self.groups = groups;
+                        // A late startup/reconnect response must not dismiss local history.
+                        let showing_history = self.showing_history;
                         self.load_forum(4, "综合版1".into(), cx);
+                        self.showing_history = showing_history;
                     }
                     Err(e) => self.notice = e,
                 }
@@ -413,33 +477,18 @@ impl Island {
                     }
                 }
             }
-            Response::Thread(g, page, result) if g == self.thread_epoch => match result {
-                Ok(post) => {
-                    let previous_page = self.navigation.current();
-                    if self.navigation.receive(page, Some(post)) {
-                        self.tree = self.navigation.tree();
-                        if self.navigation.current() != previous_page || self.reading_reset_pending
-                        {
-                            self.reset_reading_scroll();
-                        }
-                        self.reading_reset_pending = false;
-                        self.reading_retry = None;
-                        self.reading_paging.failed = false;
-                        self.notice = format!("已加载第 {page} 页 · 引用树仅聚合已加载范围");
-                    }
-                }
-                Err(error) => {
-                    self.navigation.receive(page, None);
-                    self.reading_reset_pending = false;
-                    self.reading_paging.failed = true;
-                    self.notice = format!("第 {page} 页加载失败，已保留当前内容：{error}");
-                }
-            },
-            Response::Sent(result) => {
+            Response::Thread(g, page, result) if g == self.thread_epoch => {
+                self.receive_thread_page(page, result, false, cx);
+            }
+            Response::Sent(result, history_error) => {
                 self.sending = false;
                 match result {
                     Ok(message) => {
-                        self.notice = format!("发送结果：{message}");
+                        self.notice = if let Some(error) = history_error {
+                            format!("发送成功，但本地发帖历史保存失败：{error}")
+                        } else {
+                            format!("发送结果：{message} · 已保存发帖历史")
+                        };
                         self.composing = false;
                         self.kaomoji_open = false;
                         self.clear_draft = true;
@@ -459,6 +508,7 @@ impl Island {
         if self.forum_loading {
             return;
         }
+        self.showing_history = false;
         self.showing_subscriptions = false;
         self.forum = id;
         self.forum_name = name;
@@ -472,31 +522,22 @@ impl Island {
         self.request_forum_next(cx);
     }
     fn open_thread(&mut self, id: u64, cx: &mut Context<Self>) {
-        if self.navigation.loading() || self.selected == Some(id) {
-            return;
-        }
-        self.selected = Some(id);
-        self.reader_target_changed();
-        self.tree = None;
-        self.navigation = Navigation::default();
-        self.reset_reading_scroll();
-        self.reading_paging = ScrollPaging::default();
-        self.reading_reset_pending = false;
-        self.reading_retry = None;
-        self.thread_epoch += 1;
-        self.collapsed.clear();
-        self.request_page(1, PageMode::Navigate, cx);
+        self.open_saved_thread(id, cx);
     }
 
     fn request_page(&mut self, page: u32, mode: PageMode, cx: &mut Context<Self>) {
         let Some(id) = self.selected else {
             return;
         };
+        if matches!(mode, PageMode::Jump | PageMode::Refresh) {
+            self.save_reading_position();
+        }
         match self.navigation.request(page, mode) {
             PageAction::Ignored => return,
             PageAction::Cached => {
                 self.tree = self.navigation.tree();
-                if !matches!(mode, PageMode::Buffer | PageMode::Recheck) {
+                if matches!(mode, PageMode::Jump | PageMode::Refresh) {
+                    self.reading_restore = None;
                     self.reset_reading_scroll();
                 }
                 self.reading_retry = None;
@@ -504,7 +545,19 @@ impl Island {
                 self.notice = format!("第 {page} 页 · 使用已加载内容");
             }
             PageAction::Fetch => {
-                self.reading_reset_pending = !matches!(mode, PageMode::Buffer | PageMode::Recheck);
+                self.reading_reset_pending = matches!(mode, PageMode::Jump | PageMode::Refresh);
+                if !self.reading_reset_pending {
+                    let cached = self
+                        .history
+                        .as_ref()
+                        .and_then(|store| store.cached_page(id, page).ok().flatten());
+                    if !matches!(mode, PageMode::Recheck)
+                        && let Some(post) = cached
+                    {
+                        self.receive_thread_page(page, Ok(post), true, cx);
+                        return;
+                    }
+                }
                 self.reading_retry = Some((page, mode));
                 self.reading_paging.failed = false;
                 self.notice = format!("正在加载第 {page} 页…");
@@ -560,15 +613,7 @@ impl Island {
         if self.navigation.current() == 0 {
             return Some((1, PageMode::Navigate));
         }
-        if self.aggregate {
-            self.navigation.after().map(|page| (page, PageMode::Buffer))
-        } else {
-            self.navigation
-                .current()
-                .checked_add(1)
-                .filter(|&page| page <= self.navigation.total())
-                .map(|page| (page, PageMode::Navigate))
-        }
+        self.navigation.after().map(|page| (page, PageMode::Buffer))
     }
 
     fn scroll_forum(
@@ -615,11 +660,7 @@ impl Island {
     ) {
         let delta = event.delta.pixel_delta(px(20.)).y;
         let downward = delta < px(0.);
-        if delta == px(0.)
-            || self.selected.is_none()
-            || self.navigation.loading()
-            || self.reading_paging.check_pending
-        {
+        if delta == px(0.) || self.selected.is_none() || self.reading_paging.check_pending {
             return;
         }
         self.reading_paging.check_pending = true;
@@ -629,6 +670,7 @@ impl Island {
                 return;
             }
             this.reading_paging.check_pending = false;
+            this.schedule_position_save(cx);
             let at_bottom =
                 this.reading_scroll.offset().y + this.reading_scroll.max_offset().height <= px(2.);
             if !this.navigation.loading()
@@ -1155,7 +1197,15 @@ impl Island {
     fn page_toolbar(&self, cx: &mut Context<Self>) -> AnyElement {
         let p = Palette::current(cx);
         let loading = self.navigation.loading();
-        let current = self.navigation.current();
+        let current = self
+            .reading_restore
+            .as_ref()
+            .map(|position| position.page)
+            .or_else(|| {
+                self.capture_reading_position()
+                    .map(|position| position.page)
+            })
+            .unwrap_or(self.navigation.current());
         let total = self.navigation.total();
         let range = self.navigation.range();
         let before = self.navigation.before();
@@ -1184,14 +1234,12 @@ impl Island {
                     .gap_2()
                     .child(
                         button(p, "previous-page", "上一页")
-                            .when(loading || current <= 1, |d| d.opacity(0.4))
+                            .when(loading || self.navigation.before().is_none(), |d| {
+                                d.opacity(0.4)
+                            })
                             .on_click(cx.listener(|this, _, _, cx| {
-                                if this.navigation.current() > 1 {
-                                    this.request_page(
-                                        this.navigation.current() - 1,
-                                        PageMode::Navigate,
-                                        cx,
-                                    );
+                                if let Some(page) = this.navigation.before() {
+                                    this.request_page(page, PageMode::Buffer, cx);
                                 }
                             })),
                     )
@@ -1202,16 +1250,12 @@ impl Island {
                     }))
                     .child(
                         button(p, "next-page", "下一页")
-                            .when(loading || current == 0 || current >= total, |d| {
+                            .when(loading || self.navigation.after().is_none(), |d| {
                                 d.opacity(0.4)
                             })
                             .on_click(cx.listener(|this, _, _, cx| {
-                                if this.navigation.current() > 0 {
-                                    this.request_page(
-                                        this.navigation.current().saturating_add(1),
-                                        PageMode::Navigate,
-                                        cx,
-                                    );
+                                if let Some(page) = this.navigation.after() {
+                                    this.request_page(page, PageMode::Buffer, cx);
                                 }
                             })),
                     )
@@ -1370,6 +1414,7 @@ impl Render for Island {
         self.install_preview_shortcuts(window, cx);
         let p = Palette::current(cx);
         self.clear_current_draft(window, cx);
+        self.schedule_reading_restore(window, cx);
         let mut forums = div()
             .id("forums-scroll")
             .flex_1()
@@ -1423,6 +1468,15 @@ impl Render for Island {
                         if !this.showing_subscriptions || !this.forum_loading {
                             this.load_subscriptions(cx);
                         }
+                    })),
+            )
+            .child(
+                button(p, "history", "◷ 历史记录")
+                    .mx_3()
+                    .mb_2()
+                    .when(self.showing_history, |d| d.bg(rgb(p.selected)))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.open_history(HistoryCategory::Browsing, cx)
                     })),
             )
             .child(forums)
@@ -1689,7 +1743,11 @@ impl Render for Island {
                     .child(if self.navigation.loading() {
                         "正在加载…"
                     } else if self.reading_paging.failed {
-                        "加载失败，当前内容已保留"
+                        if self.tree.is_some() {
+                            "加载失败，当前内容已保留"
+                        } else {
+                            "加载失败，请重试"
+                        }
                     } else if end {
                         "已到当前最后一页"
                     } else {
@@ -1723,14 +1781,11 @@ impl Render for Island {
                                         if let Some((page, mode)) = request {
                                             this.request_page(page, mode, cx);
                                         } else {
-                                            let page = if this.aggregate {
-                                                this.navigation
-                                                    .range()
-                                                    .map(|(_, last)| last)
-                                                    .unwrap_or(1)
-                                            } else {
-                                                this.navigation.current().max(1)
-                                            };
+                                            let page = this
+                                                .navigation
+                                                .range()
+                                                .map(|(_, last)| last)
+                                                .unwrap_or(1);
                                             this.request_page(page, PageMode::Recheck, cx);
                                         }
                                     },
@@ -1786,6 +1841,13 @@ impl Render for Island {
                                 this.request_page(1, PageMode::Refresh, cx);
                             },
                         )))
+                    })
+                    .when(self.selected.is_some(), |d| {
+                        d.child(
+                            button(p, "clear-thread-cache", "清除本串缓存并重载").on_click(
+                                cx.listener(|this, _, _, cx| this.clear_thread_cache(cx)),
+                            ),
+                        )
                     })
                     .child(
                         button(p, "aggregate", "引用树")
@@ -1981,10 +2043,15 @@ impl Render for Island {
         } else {
             None
         };
+        let reader = if self.showing_history {
+            self.render_history(cx)
+        } else {
+            reader.into_any_element()
+        };
         let columns = self.panes.render(
             sidebar.into_any_element(),
             thread_list.into_any_element(),
-            reader.into_any_element(),
+            reader,
             editor,
             window,
             cx,

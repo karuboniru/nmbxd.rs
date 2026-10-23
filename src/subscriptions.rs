@@ -5,6 +5,7 @@ use crate::*;
 impl Island {
     pub(crate) fn load_subscriptions(&mut self, cx: &mut Context<Self>) {
         // A new list generation supersedes any in-flight forum/feed response.
+        self.showing_history = false;
         self.showing_subscriptions = true;
         self.forum_epoch += 1;
         self.threads.clear();

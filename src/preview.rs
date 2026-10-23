@@ -217,18 +217,11 @@ impl Island {
                     self.previews[index].error = Some("当前串正在加载，请稍后跳转".into());
                     return;
                 }
-                self.selected = Some(post.id);
-                self.reader_target_changed();
-                self.thread_epoch += 1;
-                self.navigation = Navigation::default();
-                self.navigation.request(1, PageMode::Navigate);
-                self.navigation.receive(1, Some(post));
-                self.tree = self.navigation.tree();
-                self.reset_reading_scroll();
-                self.reading_paging = ScrollPaging::default();
-                self.reading_reset_pending = false;
-                self.reading_retry = None;
-                self.collapsed.clear();
+                let id = post.id;
+                if let Some(store) = &self.history {
+                    let _ = store.cache_page(id, 1, &post);
+                }
+                self.open_thread(id, cx);
                 self.previews.clear();
             }
             Err(error) => {
