@@ -1994,10 +1994,19 @@ impl Render for Island {
                             .px_4()
                             .py_2()
                             .child(
-                                img(image.preview.clone())
+                                div()
+                                    .relative()
                                     .w_full()
                                     .h(px(96.))
-                                    .object_fit(ObjectFit::Contain),
+                                    .flex_shrink_0()
+                                    .overflow_hidden()
+                                    .child(
+                                        img(image.preview.clone())
+                                            .absolute()
+                                            .inset_0()
+                                            .size_full()
+                                            .object_fit(ObjectFit::Contain),
+                                    ),
                             )
                             .child(div().text_xs().text_color(rgb(p.muted)).child(format!(
                                 "{} · {:.1} KiB",
