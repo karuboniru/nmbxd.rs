@@ -33,7 +33,8 @@ name="rdnmb-${version}-macos-${arch}"
 binary="${CARGO_TARGET_DIR:-target}/$target/release/rdnmb"
 [[ -f $binary && -x $binary ]] || { echo "Release binary missing: $binary" >&2; exit 1; }
 # Check the actual executable before labelling the archive with its architecture.
-lipo -verify_arch "$macho_arch" "$binary"
+# -verify_arch consumes all following arguments as architecture names.
+lipo "$binary" -verify_arch "$macho_arch"
 mkdir -p dist
 stage=$(mktemp -d "$project_dir/dist/.package.XXXXXXXX")
 trap 'rm -rf -- "$stage"' EXIT
