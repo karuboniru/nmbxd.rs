@@ -66,7 +66,7 @@ cd rdnmb-版本-linux-架构
 ./rdnmb
 ```
 
-也可在解压目录执行 `./install.sh`，安装到当前用户的 `~/.local/bin` 及应用菜单，无需 sudo。应用 ID 为 `org.niconi.rdnmb`，桌面文件名为 `org.niconi.rdnmb.desktop`。通过菜单启动后，可在标题栏“设置”中填写饼干；从终端启动也可使用环境变量或当前目录的 `.env`。
+也可在解压目录执行 `./install.sh`，安装到当前用户的 `~/.local/bin` 及应用菜单，无需 sudo。应用 ID 为 `org.niconi.rdnmb`，桌面文件名为 `org.niconi.rdnmb.desktop`。通过菜单启动后，可在标题栏“设置”中导入饼干二维码的图像链接并选择认证饼干；从终端启动也可使用环境变量或当前目录的 `.env`。
 
 从旧版升级时，请先在旧发行包目录运行旧版 `./uninstall.sh`，再安装新版；新版安装器保留旧 `nmbxd` 程序、桌面入口和图标，不会自动删除它们。新版 `./uninstall.sh` 删除新版安装文件，不删除用户凭据。
 

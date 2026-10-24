@@ -6083,6 +6083,7 @@ dependencies = [
  "anyhow",
  "arboard",
  "ashpd 0.11.1",
+ "base64 0.22.1",
  "chrono",
  "dotenvy",
  "gpui",

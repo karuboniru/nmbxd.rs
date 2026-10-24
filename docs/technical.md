@@ -14,7 +14,7 @@ Linux 文件对话框使用 XDG Desktop Portal（ashpd），其他平台使用 r
 
 Linux 配置目录默认为 `~/.config/rdnmb/`，Windows 为 `%APPDATA%\rdnmb\`；可通过绝对路径的 `XDG_CONFIG_HOME` 覆盖基础目录。`settings.json` 保存设置，`appearance.json` 保存主题，`history.sqlite3` 保存历史与分页快照，`media-cache/` 保存已加载图片。
 
-未保存界面设置时，从项目目录启动会读取 `.env`。优先使用 `RDNMB_COOKIE`，兼容旧变量 `NMBXD_COOKIE`、`userhash` 或现有文件使用的 `usrhash`；值为原始百分号编码饼干，也支持 `userhash=…` 形式。保存的界面设置优先于环境变量和 `.env`，清空 Cookie 并保存后不会重新采用旧值。
+未保存界面设置时，从项目目录启动会读取 `.env`。优先使用 `RDNMB_COOKIE`，兼容旧变量 `NMBXD_COOKIE`、`userhash` 或现有文件使用的 `usrhash`；值为原始百分号编码饼干，也支持 `userhash=…` 形式。保存的界面设置优先于环境变量和 `.env`，选择游客并保存后不会重新采用旧值。
 
 Cookie 以本地明文保存，不使用密钥环；Linux 设置文件权限为 `0600`，保存使用临时文件原子替换。`.env` 已忽略，发行包不包含真实凭据。数据库不保存 Cookie。旧 `nmbxd` 目录的设置会自动迁移，具体行为见[使用说明](usage.md#设置)。
 

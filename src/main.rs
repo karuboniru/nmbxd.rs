@@ -4,6 +4,7 @@ mod appearance;
 mod assets;
 mod attachments;
 mod config_paths;
+mod cookies;
 mod drafts;
 mod emoji;
 #[cfg(not(target_os = "linux"))]
@@ -21,6 +22,7 @@ mod navigation;
 mod panes;
 mod preview;
 mod preview_shortcuts;
+mod reply_cookies;
 mod scrolling;
 mod selectable_content;
 mod settings;
@@ -28,9 +30,10 @@ mod subscriptions;
 use appearance::{Appearance, Palette};
 use gpui::{prelude::*, *};
 use gpui_component::{
-    Root,
+    Disableable, Root,
+    button::Button,
     input::{Input, InputEvent, InputState},
-    menu::{ContextMenuExt, PopupMenuItem},
+    menu::{ContextMenuExt, DropdownMenu, PopupMenuItem},
 };
 use navigation::{Navigation, PageAction, PageMode, parse_page};
 use rdnmb::{
@@ -59,6 +62,8 @@ enum Request {
         String,
         String,
         Option<rdnmb::api::ImageAttachment>,
+        String,
+        String,
     ),
 }
 enum Response {
@@ -69,16 +74,19 @@ enum Response {
     Forums(Result<Vec<ForumGroup>, String>),
     Forum(u64, u32, Result<Vec<Post>, String>),
     Thread(u64, u32, Result<Post, String>),
-    Sent(Result<String, String>, Option<String>),
+    Sent(Result<String, String>, Option<String>, Option<u64>, String),
 }
 
 struct ComposerDraft {
+    cookie: Option<String>,
     body: Entity<InputState>,
     title: Entity<InputState>,
     attachment: Option<attachments::DraftImage>,
 }
 
 struct Island {
+    reply_cookies: reply_cookies::ReplyCookies,
+    compose_cookie: Option<String>,
     history: Option<HistoryStore>,
     showing_history: bool,
     history_category: HistoryCategory,
@@ -217,6 +225,7 @@ impl Island {
                             )?;
                             settings.website_base = client.website_base().to_owned();
                             settings.save()?;
+                            settings.deleted_cookies.clear();
                             api = client;
                             Ok(settings)
                         })()
@@ -248,14 +257,26 @@ impl Island {
                         page,
                         api.thread_page(id, page).map_err(|e| e.to_string()),
                     ),
-                    Request::Send(target, fid, title, body, image) => {
-                        let result = match target {
-                            Some(id) => api.reply_with_image(id, "", &title, &body, image.as_ref()),
-                            None => {
-                                api.post_thread_with_image(fid, "", &title, &body, image.as_ref())
-                            }
-                        }
-                        .map_err(|e| e.to_string());
+                    Request::Send(target, fid, title, body, image, cookie_name, cookie_value) => {
+                        let result =
+                            ApiClient::with_website_base(Some(&cookie_value), api.website_base())
+                                .and_then(|posting_api| match target {
+                                    Some(id) => posting_api.reply_with_image(
+                                        id,
+                                        "",
+                                        &title,
+                                        &body,
+                                        image.as_ref(),
+                                    ),
+                                    None => posting_api.post_thread_with_image(
+                                        fid,
+                                        "",
+                                        &title,
+                                        &body,
+                                        image.as_ref(),
+                                    ),
+                                })
+                                .map_err(|e| e.to_string());
                         // Capture the exact submitted draft, not the current editor state.
                         let history_error = if let Ok(message) = &result {
                             if let Some(store) = &posting_history {
@@ -278,7 +299,7 @@ impl Island {
                         } else {
                             None
                         };
-                        Response::Sent(result, history_error)
+                        Response::Sent(result, history_error, target, cookie_name)
                     }
                 };
                 if out.send(result).is_err() {
@@ -322,7 +343,16 @@ impl Island {
         let panes = panes::PaneLayout::new(cx);
         let media = cx.new(|_| media::MediaStore::new());
         cx.observe(&media, |_, _, cx| cx.notify()).detach();
+        let (reply_cookies, cookie_memory_error) = match reply_cookies::ReplyCookies::load() {
+            Ok(memory) => (memory, None),
+            Err(error) => (
+                Default::default(),
+                Some(format!("回复饼干记录不可用：{error}")),
+            ),
+        };
         Self {
+            reply_cookies,
+            compose_cookie: None,
             history,
             showing_history: false,
             history_category: HistoryCategory::Browsing,
@@ -395,7 +425,9 @@ impl Island {
             attachment_loading: false,
             attachment_revision: 0,
             cookie,
-            notice: history_error.unwrap_or_else(|| "正在连接岛屿…".into()),
+            notice: history_error
+                .or(cookie_memory_error)
+                .unwrap_or_else(|| "正在连接岛屿…".into()),
         }
     }
 
@@ -488,7 +520,7 @@ impl Island {
             Response::Thread(g, page, result) if g == self.thread_epoch => {
                 self.receive_thread_page(page, result, false, cx);
             }
-            Response::Sent(result, history_error) => {
+            Response::Sent(result, history_error, target, cookie_name) => {
                 self.sending = false;
                 match result {
                     Ok(message) => {
@@ -497,6 +529,11 @@ impl Island {
                         } else {
                             format!("发送结果：{message} · 已保存发帖历史")
                         };
+                        if let Err(error) = self.reply_cookies.record(target, &cookie_name) {
+                            self.notice
+                                .push_str(&format!(" · 回复饼干记录保存失败：{error}"));
+                        }
+                        self.compose_cookie = None;
                         self.composing = false;
                         self.kaomoji_open = false;
                         self.clear_draft = true;
@@ -748,11 +785,13 @@ impl Island {
             self.attachment_revision += 1;
             self.attachment_loading = false;
             let current = ComposerDraft {
+                cookie: self.compose_cookie.take(),
                 body: self.body.clone(),
                 title: self.title.clone(),
                 attachment: self.attachment.take(),
             };
             let next = self.drafts.switch(from, to, current, || ComposerDraft {
+                cookie: None,
                 body: cx.new(|cx| {
                     InputState::new(window, cx)
                         .multi_line(true)
@@ -761,6 +800,7 @@ impl Island {
                 title: cx.new(|cx| InputState::new(window, cx).placeholder("标题（可选）")),
                 attachment: None,
             });
+            self.compose_cookie = next.cookie;
             self.body = next.body;
             self.title = next.title;
             self.attachment = next.attachment;
@@ -787,8 +827,52 @@ impl Island {
         self.body.update(cx, |input, cx| input.focus(window, cx));
         cx.notify();
     }
+    fn posting_cookie_name(&self) -> Option<&str> {
+        self.compose_cookie
+            .as_deref()
+            .filter(|name| self.settings.cookies.contains_key(*name))
+            .or_else(|| {
+                self.reply_cookies.selected(
+                    self.compose_target,
+                    self.settings.auth_cookie.as_deref(),
+                    &self.settings.cookies,
+                )
+            })
+    }
+
+    fn cookie_dropdown(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let selected = self.posting_cookie_name().map(str::to_owned);
+        let names: Vec<_> = self.settings.cookies.keys().cloned().collect();
+        let view = cx.entity();
+        Button::new("posting-cookie")
+            .label(format!(
+                "回复 / 发串饼干：{} ▾",
+                selected.as_deref().unwrap_or("请选择")
+            ))
+            .disabled(self.sending)
+            .dropdown_menu(move |mut menu, _, _| {
+                for name in &names {
+                    let chosen = name.clone();
+                    let view = view.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(name.clone())
+                            .checked(selected.as_ref() == Some(name))
+                            .on_click(move |_, _, cx| {
+                                view.update(cx, |this, cx| {
+                                    if !this.sending {
+                                        this.compose_cookie = Some(chosen.clone());
+                                        cx.notify();
+                                    }
+                                });
+                            }),
+                    );
+                }
+                menu
+            })
+    }
+
     fn send(&mut self, cx: &mut Context<Self>) {
-        if self.sending || !self.cookie || self.attachment_loading || !self.composing {
+        if self.sending || self.attachment_loading || !self.composing {
             return;
         }
         if self.clear_draft
@@ -799,6 +883,12 @@ impl Island {
             cx.notify();
             return;
         }
+        let Some(cookie_name) = self.posting_cookie_name().map(str::to_owned) else {
+            self.notice = "请先导入饼干，并在回复框选择用于发送的饼干".into();
+            cx.notify();
+            return;
+        };
+        let cookie_value = self.settings.cookies[&cookie_name].clone();
         let body = self.body.read(cx).value().to_string();
         if body.trim().is_empty() && self.attachment.is_none() {
             self.notice = "请填写正文或添加图片后再发送".into();
@@ -806,7 +896,8 @@ impl Island {
             return;
         }
         self.sending = true;
-        self.tx
+        if self
+            .tx
             .send(Request::Send(
                 self.compose_target,
                 self.compose_forum,
@@ -815,8 +906,14 @@ impl Island {
                 self.attachment
                     .as_ref()
                     .map(|image| image.attachment.clone()),
+                cookie_name,
+                cookie_value,
             ))
-            .ok();
+            .is_err()
+        {
+            self.sending = false;
+            self.notice = "后台服务不可用，草稿已保留，请重启客户端".into();
+        }
         cx.notify();
     }
 
@@ -1927,6 +2024,7 @@ impl Render for Island {
                 .border_l_1()
                 .border_color(rgb(p.border))
                 .child(heading(p, "WRITE / 写点什么", self.compose_label.clone()))
+                .child(div().px_4().child(self.cookie_dropdown(cx)))
                 .child(
                     div()
                         .p_4()
@@ -2066,7 +2164,7 @@ impl Render for Island {
                                 "send",
                                 if self.sending {
                                     "发送中…"
-                                } else if !self.cookie {
+                                } else if self.posting_cookie_name().is_none() {
                                     "需要饼干"
                                 } else {
                                     "发送 ↗"
