@@ -1,5 +1,5 @@
 //! Blocking HTTP client. Call from worker threads, never from the GUI update loop.
-use crate::model::{ForumGroup, Post, html_to_text};
+use crate::model::{ForumGroup, Post, Timeline, html_to_text};
 use anyhow::{Context, Result, anyhow, bail};
 use regex::Regex;
 use reqwest::blocking::{Client, RequestBuilder, multipart};
@@ -217,6 +217,34 @@ impl ApiClient {
 
     pub fn forum_groups(&self) -> Result<Vec<ForumGroup>> {
         self.read(self.client.get(format!("{API_BASE}getForumList")))
+    }
+
+    pub fn timelines(&self) -> Result<Vec<Timeline>> {
+        self.timelines_at(&format!("{API_BASE}getTimelineList"))
+    }
+
+    fn timelines_at(&self, endpoint: &str) -> Result<Vec<Timeline>> {
+        self.read(self.client.get(endpoint))
+    }
+
+    /// Timeline IDs belong to a separate namespace from forum IDs.
+    /// The server repeats its final page beyond the timeline's `max_page`.
+    pub fn timeline_page(&self, id: i64, page: u32) -> Result<Vec<Post>> {
+        self.timeline_page_at(&format!("{API_BASE}timeline"), id, page)
+    }
+
+    fn timeline_page_at(&self, endpoint: &str, id: i64, page: u32) -> Result<Vec<Post>> {
+        if id <= 0 {
+            bail!("请选择有效时间线");
+        }
+        if page == 0 {
+            bail!("页码必须大于零");
+        }
+        self.read(
+            self.client
+                .get(endpoint)
+                .query(&[("id", id.to_string()), ("page", page.to_string())]),
+        )
     }
 
     pub fn forum_page(&self, id: i64, page: u32) -> Result<Vec<Post>> {
@@ -526,6 +554,68 @@ fn parse_post_response(body: &str) -> Result<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn timelines_use_separate_get_endpoints_and_keep_original_forum_ids() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for body in [
+                r#"[{"id":1,"name":"综合线","display_name":"综合线","notice":"主时间线","max_page":20}]"#,
+                r#"[{"id":"123","fid":"4","ReplyCount":"7","content":"forum four"},{"id":456,"fid":30,"content":"forum thirty"}]"#,
+                r#"{"success":false,"error":"必须登入领取饼干后才可以访问"}"#,
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                requests.push(read_mock_request(&mut stream));
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            }
+            requests
+        });
+        let api = ApiClient::new(None).unwrap();
+        let base = format!("http://{address}");
+        let timelines = api
+            .timelines_at(&format!("{base}/getTimelineList"))
+            .unwrap();
+        assert_eq!(timelines[0].id, 1);
+        assert_eq!(timelines[0].max_page, 20);
+        let posts = api
+            .timeline_page_at(&format!("{base}/timeline"), 1, 2)
+            .unwrap();
+        assert_eq!(posts.len(), 2);
+        assert_eq!(
+            (posts[0].id, posts[0].fid, posts[0].reply_count),
+            (123, 4, 7)
+        );
+        assert_eq!((posts[1].id, posts[1].fid), (456, 30));
+        assert!(
+            api.timeline_page_at(&format!("{base}/timeline"), 2, 1)
+                .unwrap_err()
+                .to_string()
+                .contains("饼干")
+        );
+        let requests = server.join().unwrap();
+        assert!(requests[0].starts_with("GET /getTimelineList HTTP/1.1"));
+        assert!(requests[1].starts_with("GET /timeline?id=1&page=2 HTTP/1.1"));
+        assert!(requests[2].starts_with("GET /timeline?id=2&page=1 HTTP/1.1"));
+    }
+
+    #[test]
+    fn timeline_requests_validate_ids_and_pages_before_sending() {
+        let api = ApiClient::new(None).unwrap();
+        for id in [-1, 0] {
+            assert!(api.timeline_page(id, 1).is_err());
+            assert!(api.forum_page(id, 1).is_err());
+        }
+        assert!(api.timeline_page(1, 0).is_err());
+    }
 
     #[test]
     fn subscription_ids_are_validated_without_requiring_uuid_syntax() {

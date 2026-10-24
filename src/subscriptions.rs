@@ -7,6 +7,7 @@ impl Island {
         // A new list generation supersedes any in-flight forum/feed response.
         self.showing_history = false;
         self.showing_subscriptions = true;
+        self.timeline = None;
         self.forum_epoch += 1;
         self.threads.clear();
         self.forum_page = 0;

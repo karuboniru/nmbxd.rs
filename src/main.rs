@@ -26,6 +26,7 @@ mod scrolling;
 mod selectable_content;
 mod settings;
 mod subscriptions;
+mod timeline_navigation;
 use appearance::{Appearance, Palette};
 use gpui::{prelude::*, *};
 use gpui_component::{
@@ -40,7 +41,7 @@ use rdnmb::{
     api::ApiClient,
     config_paths,
     history::{HistoryCategory, HistoryEntry, HistoryStore, PostingEntry, ReadingPosition},
-    model::{ForumGroup, Post},
+    model::{ForumGroup, Post, Timeline},
     tree::ThreadTree,
 };
 use scrolling::ScrollPaging;
@@ -54,6 +55,8 @@ enum Request {
     JumpProbe(u64, u64, std::sync::Weak<()>),
     Configure(Settings),
     Forums,
+    Timelines,
+    Timeline(u64, i64, u32),
     Forum(u64, i64, u32),
     Thread(u64, u64, u32),
     Send(
@@ -72,6 +75,7 @@ enum Response {
     JumpProbe(u64, Result<Post, String>),
     Configured(Result<Settings, String>),
     Forums(Result<Vec<ForumGroup>, String>),
+    Timelines(Result<Vec<Timeline>, String>),
     Forum(u64, u32, Result<Vec<Post>, String>),
     Thread(u64, u32, Result<Post, String>),
     Sent(Result<String, String>, Option<String>, Option<u64>, String),
@@ -121,6 +125,10 @@ struct Island {
     title_drag: bool,
     tx: mpsc::Sender<Request>,
     groups: Vec<ForumGroup>,
+    timelines: Vec<Timeline>,
+    timeline: Option<Timeline>,
+    timelines_loading: bool,
+    timelines_error: Option<String>,
     forum: i64,
     forum_name: String,
     threads: Vec<Post>,
@@ -244,6 +252,14 @@ impl Island {
                     Request::Forums => {
                         Response::Forums(api.forum_groups().map_err(|e| e.to_string()))
                     }
+                    Request::Timelines => {
+                        Response::Timelines(api.timelines().map_err(|e| e.to_string()))
+                    }
+                    Request::Timeline(g, id, page) => Response::Forum(
+                        g,
+                        page,
+                        api.timeline_page(id, page).map_err(|e| e.to_string()),
+                    ),
                     Request::Forum(g, id, page) => Response::Forum(
                         g,
                         page,
@@ -324,6 +340,8 @@ impl Island {
         })
         .detach();
         tx.send(Request::Forums).ok();
+        tx.send(Request::Timelines).ok();
+        tx.send(Request::Forum(1, 4, 1)).ok();
         let page_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("页码")
@@ -387,11 +405,15 @@ impl Island {
             title_drag: false,
             tx,
             groups: vec![],
+            timelines: vec![],
+            timeline: None,
+            timelines_loading: true,
+            timelines_error: None,
             forum: 4,
             forum_name: "综合版1".into(),
             threads: vec![],
             forum_page: 0,
-            forum_epoch: 0,
+            forum_epoch: 1,
             forum_scroll: ScrollHandle::new(),
             forum_paging: ScrollPaging::default(),
             forum_end: false,
@@ -410,7 +432,7 @@ impl Island {
             reading_retry: None,
             panes,
             groups_loading: true,
-            forum_loading: false,
+            forum_loading: true,
             aggregate: false,
             collapsed: HashSet::new(),
             composing: false,
@@ -475,14 +497,25 @@ impl Island {
             Response::Forums(result) => {
                 self.groups_loading = false;
                 match result {
-                    Ok(groups) => {
-                        self.groups = groups;
-                        // A late startup/reconnect response must not dismiss local history.
-                        let showing_history = self.showing_history;
-                        self.load_forum(4, "综合版1".into(), cx);
-                        self.showing_history = showing_history;
-                    }
+                    Ok(groups) => self.groups = groups,
                     Err(e) => self.notice = e,
+                }
+            }
+            Response::Timelines(result) => {
+                self.timelines_loading = false;
+                match result {
+                    Ok(timelines) => {
+                        // Refresh metadata without changing the active list or its generation.
+                        if let Some(selected) = &mut self.timeline
+                            && let Some(updated) =
+                                timelines.iter().find(|item| item.id == selected.id)
+                        {
+                            *selected = updated.clone();
+                        }
+                        self.timelines = timelines;
+                        self.timelines_error = None;
+                    }
+                    Err(error) => self.timelines_error = Some(error),
                 }
             }
             Response::Forum(g, page, result) if g == self.forum_epoch => {
@@ -507,14 +540,13 @@ impl Island {
                         }
                         // Forum pages have no total; pinned posts may repeat and
                         // page size alone cannot establish the end.
-                        self.forum_end = if self.showing_subscriptions {
-                            returned_empty
-                        } else {
-                            self.threads.len() == previous_len
-                        };
-                        if !self.forum_end {
-                            self.forum_page = page;
-                        }
+                        self.forum_page = page;
+                        self.forum_end = self.timeline_limit_reached(page)
+                            || if self.showing_subscriptions {
+                                returned_empty
+                            } else {
+                                self.threads.len() == previous_len
+                            };
                         self.forum_paging.failed = false;
                         self.notice = "慢慢浏览，自在交流".into();
                     }
@@ -557,11 +589,10 @@ impl Island {
     }
 
     fn load_forum(&mut self, id: i64, name: String, cx: &mut Context<Self>) {
-        if self.forum_loading {
-            return;
-        }
         self.showing_history = false;
         self.showing_subscriptions = false;
+        self.timeline = None;
+        self.forum_loading = false;
         self.forum = id;
         self.forum_name = name;
         self.reader_target_changed();
@@ -642,6 +673,11 @@ impl Island {
             self.forum_end = true;
             return;
         };
+        if self.timeline_limit_reached(self.forum_page) {
+            self.forum_end = true;
+            cx.notify();
+            return;
+        }
         self.forum_loading = true;
         self.forum_paging.failed = false;
         let request = if self.showing_subscriptions {
@@ -650,6 +686,8 @@ impl Island {
                 self.settings.subscription_id.clone(),
                 page,
             )
+        } else if let Some(timeline) = &self.timeline {
+            Request::Timeline(self.forum_epoch, timeline.id, page)
         } else {
             Request::Forum(self.forum_epoch, self.forum, page)
         };
@@ -766,9 +804,10 @@ impl Island {
     }
 
     pub(crate) fn reader_target_changed(&mut self) {
-        if !drafts::Target::new(self.compose_target, self.compose_forum)
-            .can_send(self.selected, self.forum)
-        {
+        if !drafts::Target::new(self.compose_target, self.compose_forum).can_send(
+            self.selected,
+            timeline_navigation::posting_forum(self.timeline.as_ref(), self.forum),
+        ) {
             self.composing = false;
             self.kaomoji_open = false;
         }
@@ -786,7 +825,8 @@ impl Island {
         }
         self.clear_current_draft(window, cx);
         let from = drafts::Target::new(self.compose_target, self.compose_forum);
-        let to = drafts::Target::new(target, self.forum);
+        let forum = timeline_navigation::posting_forum(self.timeline.as_ref(), self.forum);
+        let to = drafts::Target::new(target, forum);
         if from != to {
             // In-flight file/clipboard reads must never attach to the next draft.
             self.attachment_revision += 1;
@@ -814,10 +854,15 @@ impl Island {
             self.notice = "已切换到此目标的独立草稿；其他串的草稿已保留（本次运行内）".into();
         }
         self.compose_target = target;
-        self.compose_forum = self.forum;
-        self.compose_label = target
-            .map(|id| format!("回复 No.{id}"))
-            .unwrap_or_else(|| format!("发串到 {}", self.forum_name));
+        self.compose_forum = forum;
+        self.compose_label = target.map(|id| format!("回复 No.{id}")).unwrap_or_else(|| {
+            let name = if self.timeline.is_some() {
+                "综合版1"
+            } else {
+                &self.forum_name
+            };
+            format!("发串到 {name}")
+        });
         if let Some(id) = quote {
             let current = self.body.read(cx).value();
             let suffix = drafts::quote_suffix(&current, id);
@@ -883,8 +928,10 @@ impl Island {
             return;
         }
         if self.clear_draft
-            || !drafts::Target::new(self.compose_target, self.compose_forum)
-                .can_send(self.selected, self.forum)
+            || !drafts::Target::new(self.compose_target, self.compose_forum).can_send(
+                self.selected,
+                timeline_navigation::posting_forum(self.timeline.as_ref(), self.forum),
+            )
         {
             self.notice = "已阻止发送：草稿目标与当前浏览目标不一致，请在目标串重新点击回复".into();
             cx.notify();
@@ -1552,6 +1599,7 @@ impl Render for Island {
             .min_h_0()
             .overflow_y_scroll()
             .px_3();
+        forums = self.timeline_sidebar(forums, p, cx);
         for group in &self.groups {
             forums = forums.child(
                 div()
@@ -1573,9 +1621,13 @@ impl Render for Island {
                         button(p, ("forum", id as u64), name.clone())
                             .w_full()
                             .mb_1()
-                            .when(!self.showing_subscriptions && self.forum == id, |d| {
-                                d.bg(rgb(p.selected)).font_weight(FontWeight::SEMIBOLD)
-                            })
+                            .when(
+                                !self.showing_history
+                                    && !self.showing_subscriptions
+                                    && self.timeline.is_none()
+                                    && self.forum == id,
+                                |d| d.bg(rgb(p.selected)).font_weight(FontWeight::SEMIBOLD),
+                            )
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.load_forum(id, name.clone(), cx)
                             })),
@@ -1594,7 +1646,9 @@ impl Render for Island {
                 button(p, "subscriptions", "☆ 我的订阅")
                     .mx_3()
                     .mb_2()
-                    .when(self.showing_subscriptions, |d| d.bg(rgb(p.selected)))
+                    .when(self.showing_subscriptions && !self.showing_history, |d| {
+                        d.bg(rgb(p.selected))
+                    })
                     .on_click(cx.listener(|this, _, _, cx| {
                         if !this.showing_subscriptions || !this.forum_loading {
                             this.load_subscriptions(cx);
@@ -1741,6 +1795,8 @@ impl Render for Island {
                 } else if self.forum_end {
                     if self.showing_subscriptions {
                         "已到订阅列表末尾"
+                    } else if self.timeline.is_some() {
+                        "已到时间线末尾"
                     } else {
                         "已到板块末尾"
                     }
@@ -1751,6 +1807,7 @@ impl Render for Island {
                 })
                 .when(
                     !self.forum_loading
+                        && !self.timeline_limit_reached(self.forum_page)
                         && (self.forum_end
                             || self.forum_paging.failed
                             || self.forum_scroll.max_offset().height <= px(2.)),
@@ -1797,11 +1854,15 @@ impl Render for Island {
                         p,
                         if self.showing_subscriptions {
                             "FEED / 订阅"
+                        } else if self.timeline.is_some() {
+                            "TIMELINE / 时间线"
                         } else {
                             "BOARD / 板块"
                         },
                         if self.showing_subscriptions {
                             "我的订阅".into()
+                        } else if let Some(timeline) = &self.timeline {
+                            timeline.display_name()
                         } else {
                             self.forum_name.clone()
                         },
@@ -1821,6 +1882,8 @@ impl Render for Island {
                             if !this.forum_loading {
                                 if this.showing_subscriptions {
                                     this.load_subscriptions(cx);
+                                } else if let Some(timeline) = this.timeline.clone() {
+                                    this.load_timeline(timeline, cx);
                                 } else {
                                     this.load_forum(this.forum, this.forum_name.clone(), cx);
                                 }

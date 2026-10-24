@@ -91,6 +91,35 @@ impl Forum {
     }
 }
 
+/// Timelines aggregate multiple forums and have their own IDs and page limits.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct Timeline {
+    #[serde(deserialize_with = "integer")]
+    pub id: i64,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub display_name: String,
+    #[serde(default)]
+    pub notice: String,
+    #[serde(default, deserialize_with = "page_count")]
+    pub max_page: u32,
+}
+
+fn page_count<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+    unsigned(d)?.try_into().map_err(serde::de::Error::custom)
+}
+
+impl Timeline {
+    pub fn display_name(&self) -> String {
+        html_to_text(if self.display_name.trim().is_empty() {
+            &self.name
+        } else {
+            &self.display_name
+        })
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct Post {
     #[serde(deserialize_with = "unsigned")]
@@ -241,6 +270,26 @@ mod tests {
                 .unwrap();
         assert_eq!(forum.id, -1);
         assert_eq!(forum.display_name(), "时间&线");
+    }
+
+    #[test]
+    fn timelines_decode_metadata_and_fallback_display_names() {
+        for (id, limit) in [("1", "20"), ("\"1\"", "\"20\"")] {
+            let timeline: Timeline = serde_json::from_str(&format!(
+                r#"{{"id":{id},"name":"综合线","display_name":"<b>综合&amp;线</b>","notice":"主时间线","max_page":{limit}}}"#,
+            ))
+            .unwrap();
+            assert_eq!(timeline.id, 1);
+            assert_eq!(timeline.max_page, 20);
+            assert_eq!(timeline.notice, "主时间线");
+            assert_eq!(timeline.display_name(), "综合&线");
+        }
+        let timeline: Timeline =
+            serde_json::from_str(r#"{"id":2,"name":"创作线","display_name":" "}"#).unwrap();
+        assert_eq!(timeline.display_name(), "创作线");
+        assert_eq!(timeline.max_page, 0);
+        assert!(serde_json::from_str::<Timeline>(r#"{"id":1,"max_page":-1}"#).is_err());
+        assert!(serde_json::from_str::<Timeline>(r#"{"id":1,"max_page":4294967296}"#).is_err());
     }
 
     #[test]
