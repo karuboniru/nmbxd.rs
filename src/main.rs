@@ -114,7 +114,7 @@ struct Island {
     preview_serial: u64,
     settings: Settings,
     media: Entity<media::MediaStore>,
-    viewing_image: Option<String>,
+    viewing_image: Option<preview::ImageViewer>,
     settings_panel: Option<Entity<SettingsPanel>>,
     settings_saving: bool,
     appearance: Appearance,
@@ -1064,7 +1064,7 @@ impl Island {
                                 .child("点击查看原图"),
                         )
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.viewing_image = Some(original.clone());
+                            this.viewing_image = Some(preview::ImageViewer::new(original.clone()));
                             cx.notify();
                         })),
                 )
@@ -2225,34 +2225,8 @@ impl Render for Island {
                     .p_4()
                     .child(panel.clone())
                     .into_any_element()
-            } else if let Some(url) = &self.viewing_image {
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .flex()
-                    .flex_col()
-                    .p_4()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(div().text_sm().child("原图 · 动图暂显示首帧"))
-                            .child(self.image_actions("viewer-image-actions", url.clone(), cx))
-                            .child(button(p, "close-image", "关闭原图").on_click(cx.listener(
-                                |this, _, _, cx| {
-                                    this.viewing_image = None;
-                                    cx.notify();
-                                },
-                            ))),
-                    )
-                    .child(media_view::tile(
-                        &self.media,
-                        url.clone(),
-                        (window.viewport_size().height - px(180.)).max(px(200.)),
-                        cx,
-                    ))
-                    .into_any_element()
+            } else if self.viewing_image.is_some() {
+                self.image_overlay(cx)
             } else {
                 columns.into_any_element()
             })

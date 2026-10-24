@@ -2,7 +2,7 @@ use crate::Island;
 use gpui::{Context, KeystrokeEvent, MouseButton, MouseDownEvent, NavigationDirection, Window};
 
 /// Close exactly one layer, keeping any underlying preview intact.
-fn close_top_preview<T>(previews: &mut Vec<T>, viewing_image: &mut Option<String>) -> bool {
+fn close_top_preview<T, I>(previews: &mut Vec<T>, viewing_image: &mut Option<I>) -> bool {
     previews.pop().is_some() || viewing_image.take().is_some()
 }
 

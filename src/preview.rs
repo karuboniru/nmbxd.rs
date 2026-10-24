@@ -6,6 +6,156 @@ use rdnmb::{
     content::{LinkTarget, parse_content},
 };
 
+#[derive(Clone, Copy, Default)]
+struct ImageGeometry {
+    viewport: Bounds<Pixels>,
+    fitted: Size<Pixels>,
+}
+
+#[cfg(test)]
+mod image_viewer_tests {
+    use super::{ImageGeometry, ImageTransform, ImageViewer};
+    use core::prelude::v1::test;
+    use gpui::{Bounds, Point, point, px, size};
+
+    fn geometry() -> ImageGeometry {
+        ImageGeometry {
+            viewport: Bounds::new(point(px(20.), px(30.)), size(px(400.), px(300.))),
+            fitted: size(px(400.), px(300.)),
+        }
+    }
+
+    #[test]
+    fn zoom_preserves_the_image_coordinate_under_the_pointer() {
+        let mut transform = ImageTransform::default();
+        let geometry = geometry();
+        let pointer = geometry.viewport.center() + point(px(40.), px(-20.));
+        let before = (pointer - geometry.viewport.center() - transform.pan) / transform.zoom;
+        transform.zoom_at(100., pointer, geometry);
+        let after = (pointer - geometry.viewport.center() - transform.pan) / transform.zoom;
+        assert!((f32::from(before.x - after.x)).abs() < 0.001);
+        assert!((f32::from(before.y - after.y)).abs() < 0.001);
+        assert!(transform.zoom > 1.);
+    }
+
+    #[test]
+    fn zoom_limits_and_zooming_out_keep_the_image_visible() {
+        let mut transform = ImageTransform::default();
+        let geometry = geometry();
+        for _ in 0..100 {
+            transform.zoom_at(1000., geometry.viewport.center(), geometry);
+        }
+        assert_eq!(transform.zoom, 16.);
+        transform.pan = point(px(100.), px(100.));
+        for _ in 0..100 {
+            transform.zoom_at(-1000., geometry.viewport.center(), geometry);
+        }
+        assert_eq!(transform.zoom, 0.1);
+        assert_eq!(transform.pan, Point::default());
+        transform.zoom_at(f32::NAN, geometry.viewport.center(), geometry);
+        assert_eq!(transform.zoom, 0.1);
+    }
+
+    #[test]
+    fn dragging_moves_both_axes_clamps_edges_and_stops_on_release() {
+        let mut transform = ImageTransform {
+            zoom: 2.,
+            ..Default::default()
+        };
+        let geometry = geometry();
+        transform.drag = Some(point(px(50.), px(60.)));
+        transform.drag_to(point(px(80.), px(100.)), true, geometry);
+        assert_eq!(transform.pan, point(px(30.), px(40.)));
+        transform.drag_to(point(px(1000.), px(-1000.)), true, geometry);
+        assert_eq!(transform.pan, point(px(200.), px(-150.)));
+        transform.drag_to(point(px(50.), px(60.)), false, geometry);
+        assert!(transform.drag.is_none());
+        assert_eq!(transform.pan, point(px(200.), px(-150.)));
+    }
+
+    #[test]
+    fn reopening_an_image_resets_zoom_and_pan() {
+        let mut viewer = ImageViewer::new("first".into());
+        viewer.transform.zoom = 3.;
+        viewer.transform.pan = point(px(30.), px(40.));
+        viewer.transform.drag = Some(Point::default());
+        let viewer = ImageViewer::new(viewer.url);
+        assert_eq!(viewer.transform.zoom, 1.);
+        assert_eq!(viewer.transform.pan, Point::default());
+        assert!(viewer.transform.drag.is_none());
+    }
+}
+
+/// A fresh viewer owns its transform, so opening another image always starts fitted.
+pub(crate) struct ImageViewer {
+    pub(crate) url: String,
+    transform: ImageTransform,
+    geometry: std::rc::Rc<std::cell::Cell<ImageGeometry>>,
+}
+
+impl ImageViewer {
+    pub(crate) fn new(url: String) -> Self {
+        Self {
+            url,
+            transform: ImageTransform::default(),
+            geometry: Default::default(),
+        }
+    }
+}
+
+struct ImageTransform {
+    zoom: f32,
+    pan: Point<Pixels>,
+    drag: Option<Point<Pixels>>,
+}
+
+impl Default for ImageTransform {
+    fn default() -> Self {
+        Self {
+            zoom: 1.,
+            pan: Point::default(),
+            drag: None,
+        }
+    }
+}
+
+impl ImageTransform {
+    fn bounded_pan(&self, geometry: ImageGeometry) -> Point<Pixels> {
+        let limit_x =
+            ((geometry.fitted.width * self.zoom - geometry.viewport.size.width) / 2.).max(px(0.));
+        let limit_y =
+            ((geometry.fitted.height * self.zoom - geometry.viewport.size.height) / 2.).max(px(0.));
+        point(
+            self.pan.x.clamp(-limit_x, limit_x),
+            self.pan.y.clamp(-limit_y, limit_y),
+        )
+    }
+
+    fn zoom_at(&mut self, delta: f32, position: Point<Pixels>, geometry: ImageGeometry) {
+        if !delta.is_finite() || delta == 0. {
+            return;
+        }
+        let next = (self.zoom * (delta.clamp(-240., 240.) * 0.004).exp()).clamp(0.1, 16.);
+        let ratio = next / self.zoom;
+        let offset = position - geometry.viewport.center();
+        // Keep the pixel under the pointer fixed until an image edge is reached.
+        self.pan = offset - (offset - self.bounded_pan(geometry)) * ratio;
+        self.zoom = next;
+        self.pan = self.bounded_pan(geometry);
+    }
+
+    fn drag_to(&mut self, position: Point<Pixels>, dragging: bool, geometry: ImageGeometry) {
+        if !dragging {
+            self.drag = None;
+            return;
+        }
+        if let Some(previous) = self.drag.replace(position) {
+            self.pan = self.bounded_pan(geometry) + position - previous;
+            self.pan = self.bounded_pan(geometry);
+        }
+    }
+}
+
 pub(crate) struct Frame {
     lifetime: std::sync::Arc<()>,
     generation: u64,
@@ -17,6 +167,163 @@ pub(crate) struct Frame {
 }
 
 impl Island {
+    pub(crate) fn image_overlay(&self, cx: &mut Context<Self>) -> AnyElement {
+        let p = Palette::current(cx);
+        let viewer = self.viewing_image.as_ref().unwrap();
+        let url = viewer.url.clone();
+        let mut viewport = div()
+            .id("image-viewport")
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .overflow_hidden()
+            .rounded_md()
+            .bg(rgb(p.background))
+            .flex()
+            .items_center()
+            .justify_center();
+        match self.media.read(cx).peek(&url) {
+            Some(media::MediaState::Ready(image)) => {
+                let geometry = viewer.geometry.clone();
+                let zoom = viewer.transform.zoom;
+                let pan = viewer.transform.pan;
+                let entity = cx.entity().downgrade();
+                viewport = viewport
+                    .when(viewer.transform.drag.is_some(), |d| d.cursor_grabbing())
+                    .when(viewer.transform.drag.is_none(), |d| d.cursor_grab())
+                    .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
+                        if let Some(viewer) = this.viewing_image.as_mut() {
+                            viewer.transform.zoom_at(
+                                event.delta.pixel_delta(px(20.)).y.into(),
+                                event.position,
+                                viewer.geometry.get(),
+                            );
+                            cx.stop_propagation();
+                            cx.notify();
+                        }
+                    }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                            if let Some(viewer) = this.viewing_image.as_mut() {
+                                viewer.transform.drag = Some(event.position);
+                                cx.stop_propagation();
+                                cx.notify();
+                            }
+                        }),
+                    )
+                    .child(
+                        canvas(
+                            |_, _, _| (),
+                            move |bounds, _, window, _| {
+                                let natural = image.size(0);
+                                let fit = (f32::from(bounds.size.width) / natural.width.0 as f32)
+                                    .min(f32::from(bounds.size.height) / natural.height.0 as f32);
+                                let fitted = size(
+                                    px(natural.width.0 as f32 * fit),
+                                    px(natural.height.0 as f32 * fit),
+                                );
+                                let current = ImageGeometry {
+                                    viewport: bounds,
+                                    fitted,
+                                };
+                                geometry.set(current);
+                                let transform = ImageTransform {
+                                    zoom,
+                                    pan,
+                                    drag: None,
+                                };
+                                let image_size = size(fitted.width * zoom, fitted.height * zoom);
+                                let origin = bounds.center() + transform.bounded_pan(current)
+                                    - point(image_size.width / 2., image_size.height / 2.);
+                                let _ = window.paint_image(
+                                    Bounds::new(origin, image_size),
+                                    Corners::default(),
+                                    image,
+                                    0,
+                                    false,
+                                );
+
+                                // Window listeners retain the drag when the pointer leaves
+                                // the viewport, and release it even over the toolbar.
+                                window.on_mouse_event({
+                                    let entity = entity.clone();
+                                    move |event: &MouseMoveEvent, phase, _, cx| {
+                                        if !phase.bubble() {
+                                            return;
+                                        }
+                                        let _ = entity.update(cx, |this, cx| {
+                                            if !this.previews.is_empty() {
+                                                return;
+                                            }
+                                            if let Some(viewer) = this.viewing_image.as_mut()
+                                                && viewer.transform.drag.is_some()
+                                            {
+                                                viewer.transform.drag_to(
+                                                    event.position,
+                                                    event.dragging(),
+                                                    viewer.geometry.get(),
+                                                );
+                                                cx.stop_propagation();
+                                                cx.notify();
+                                            }
+                                        });
+                                    }
+                                });
+                                window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
+                                    if !phase.bubble() || event.button != MouseButton::Left {
+                                        return;
+                                    }
+                                    let _ = entity.update(cx, |this, cx| {
+                                        if let Some(viewer) = this.viewing_image.as_mut()
+                                            && viewer.transform.drag.take().is_some()
+                                        {
+                                            cx.stop_propagation();
+                                            cx.notify();
+                                        }
+                                    });
+                                });
+                            },
+                        )
+                        .size_full(),
+                    );
+            }
+            _ => {
+                // Reuse the shared loading/error/retry UI until the image is ready.
+                viewport = viewport.child(media_view::tile(&self.media, url.clone(), px(200.), cx));
+            }
+        }
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .p_4()
+            .capture_any_mouse_down(cx.listener(Self::preview_mouse_down))
+            .child(
+                div()
+                    .flex()
+                    .flex_shrink_0()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_sm()
+                            .child("原图 · 滚轮缩放，拖动平移 · 动图暂显示首帧"),
+                    )
+                    .child(self.image_actions("viewer-image-actions", url, cx))
+                    .child(button(p, "close-image", "关闭原图").on_click(cx.listener(
+                        |this, _, _, cx| {
+                            this.viewing_image = None;
+                            cx.notify();
+                        },
+                    ))),
+            )
+            .child(viewport)
+            .into_any_element()
+    }
+
     pub(crate) fn rich_content(
         &self,
         id: impl Into<ElementId>,
