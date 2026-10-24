@@ -39,6 +39,39 @@ pub fn write(image: Image) -> Result<(), String> {
         .map_err(clipboard_error)
 }
 
+/// Call on a worker. Read images directly because GPUI's macOS clipboard reader
+/// prefers text when both text and an image are available on the pasteboard.
+#[cfg(target_os = "macos")]
+pub fn read() -> Result<ImageData<'static>, String> {
+    let mut owner = CLIPBOARD
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .map_err(|_| "图片剪贴板暂时不可用，请重启应用后重试".to_owned())?;
+    if SHUTTING_DOWN.load(Ordering::Acquire) {
+        return Err("应用正在退出，无法粘贴图片".to_owned());
+    }
+    if owner.is_none() {
+        *owner = Some(Clipboard::new().map_err(clipboard_read_error)?);
+    }
+    owner
+        .as_mut()
+        .unwrap()
+        .get_image()
+        .map_err(clipboard_read_error)
+}
+
+#[cfg(target_os = "macos")]
+fn clipboard_read_error(error: arboard::Error) -> String {
+    match error {
+        arboard::Error::ContentNotAvailable => {
+            "剪贴板中没有可用图片，请先复制图片后重试".to_owned()
+        }
+        arboard::Error::ClipboardOccupied => "系统剪贴板正忙，请稍后重试".to_owned(),
+        arboard::Error::ConversionFailure => "无法转换系统剪贴板图片".to_owned(),
+        _ => "无法读取系统图片剪贴板，请稍后重试".to_owned(),
+    }
+}
+
 fn image_data(image: Image) -> Result<ImageData<'static>, String> {
     if image.format() != ImageFormat::Png {
         return Err("剪贴板图片必须为 PNG 格式".to_owned());

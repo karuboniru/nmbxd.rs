@@ -142,6 +142,41 @@ pub fn load_clipboard(image: Image) -> Result<DraftImage, String> {
     }
 }
 
+/// Run on a background worker: macOS pasteboards may contain text and an image
+/// together, so explicit image paste must read the native image representation.
+#[cfg(target_os = "macos")]
+pub fn load_native_clipboard() -> Result<DraftImage, String> {
+    native_clipboard_draft(crate::image_clipboard::read()?)
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn native_clipboard_draft(data: arboard::ImageData<'_>) -> Result<DraftImage, String> {
+    let dimension_error = || "图片尺寸超过限制（单边最大 8192 像素，最多 1600 万像素）".to_owned();
+    let width = u32::try_from(data.width).map_err(|_| dimension_error())?;
+    let height = u32::try_from(data.height).map_err(|_| dimension_error())?;
+    let pixels = u64::from(width) * u64::from(height);
+    if width == 0
+        || height == 0
+        || width > MAX_DIMENSION
+        || height > MAX_DIMENSION
+        || pixels > MAX_PIXELS
+        || pixels * 4 > MAX_DECODE_BYTES
+    {
+        return Err(dimension_error());
+    }
+    // Validate before owning the buffer or passing it to the PNG encoder.
+    if data.bytes.len() as u64 != pixels * 4 {
+        return Err("剪贴板图片像素数据不完整".to_owned());
+    }
+    let rgba = image::RgbaImage::from_raw(width, height, data.bytes.into_owned())
+        .ok_or_else(|| "剪贴板图片像素数据不完整".to_owned())?;
+    let mut output = CappedWriter(Vec::new());
+    image::codecs::png::PngEncoder::new(&mut output)
+        .write_image(&rgba, width, height, image::ExtendedColorType::Rgba8)
+        .map_err(|_| "剪贴板图片转换失败或转换后超过 10 MiB 限制".to_owned())?;
+    draft("clipboard.png", output.0, DynamicImage::ImageRgba8(rgba))
+}
+
 fn draft(filename: &str, bytes: Vec<u8>, decoded: DynamicImage) -> Result<DraftImage, String> {
     let attachment = ImageAttachment::new(filename, bytes).map_err(|error| error.to_string())?;
     let mut pixels = if decoded.width() > PREVIEW_DIMENSION || decoded.height() > PREVIEW_DIMENSION
@@ -263,6 +298,50 @@ mod tests {
             draft.preview.as_bytes(0).unwrap(),
             &[40, 20, 250, 255, 40, 20, 250, 255]
         );
+    }
+
+    #[test]
+    fn native_clipboard_encodes_rgba_and_builds_bgra_preview() {
+        let bytes = [250, 20, 40, 128, 10, 70, 200, 255];
+        let draft = native_clipboard_draft(arboard::ImageData {
+            width: 2,
+            height: 1,
+            bytes: std::borrow::Cow::Borrowed(&bytes),
+        })
+        .unwrap();
+        let (decoded, format) = decode(draft.attachment.bytes()).unwrap();
+        assert_eq!(format, image::ImageFormat::Png);
+        assert_eq!(decoded.to_rgba8().as_raw(), &bytes);
+        assert_eq!(
+            draft.preview.as_bytes(0).unwrap(),
+            &[40, 20, 250, 128, 200, 70, 10, 255]
+        );
+    }
+
+    #[test]
+    fn native_clipboard_rejects_invalid_dimensions_and_pixel_lengths() {
+        for (width, height) in [
+            (0, 1),
+            (1, 0),
+            (MAX_DIMENSION as usize + 1, 1),
+            (MAX_DIMENSION as usize, MAX_DIMENSION as usize),
+            (usize::MAX, usize::MAX),
+        ] {
+            let result = native_clipboard_draft(arboard::ImageData {
+                width,
+                height,
+                bytes: std::borrow::Cow::Borrowed(&[]),
+            });
+            assert!(result.err().unwrap().contains("尺寸超过限制"));
+        }
+        for bytes in [&[0u8; 3][..], &[0u8; 5][..]] {
+            let result = native_clipboard_draft(arboard::ImageData {
+                width: 1,
+                height: 1,
+                bytes: std::borrow::Cow::Borrowed(bytes),
+            });
+            assert!(result.err().unwrap().contains("像素数据不完整"));
+        }
     }
 
     #[test]
