@@ -131,8 +131,7 @@ pub fn pick_save(
     window: &Window,
     filename: String,
 ) -> impl Future<Output = Result<Option<PathBuf>, String>> + 'static + use<> {
-    let picker = rfd::AsyncFileDialog::new()
-        .set_parent(window)
+    let picker = crate::file_dialog::for_window(window)
         .set_title("保存图片")
         .set_file_name(filename)
         .save_file();

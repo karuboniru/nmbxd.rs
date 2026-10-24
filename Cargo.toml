@@ -40,6 +40,8 @@ resolver = "3"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ashpd = { version = "=0.11.1", default-features = false, features = ["async-std", "raw_handle", "wayland"] }
+
+[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
 raw-window-handle = "0.6"
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]

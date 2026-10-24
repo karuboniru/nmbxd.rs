@@ -6,6 +6,8 @@ mod attachments;
 mod config_paths;
 mod drafts;
 mod emoji;
+#[cfg(not(target_os = "linux"))]
+mod file_dialog;
 mod history_controller;
 mod history_view;
 mod image_actions;

@@ -72,8 +72,7 @@ pub fn pick_image(
     window: &Window,
 ) -> impl Future<Output = Result<Option<PathBuf>, String>> + 'static + use<> {
     // Construct the dialog on the UI thread, as required by macOS.
-    let picker = rfd::AsyncFileDialog::new()
-        .set_parent(window)
+    let picker = crate::file_dialog::for_window(window)
         .set_title("选择要附加的图片")
         .add_filter("图片 (JPEG、PNG、GIF)", &["jpg", "jpeg", "png", "gif"])
         .pick_file();
