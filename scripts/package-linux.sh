@@ -37,7 +37,7 @@ install -m644 vendor/cosmic-text/unicode/LICENSE.txt "$bundle/licenses/Unicode.t
 install -m644 vendor/cosmic-text/LICENSE-MIT "$bundle/licenses/cosmic-text-MIT.txt"
 install -m644 vendor/cosmic-text/LICENSE-APACHE "$bundle/licenses/cosmic-text-APACHE.txt"
 install -m644 vendor/gpui-component/LICENSE-APACHE "$bundle/licenses/gpui-component.txt"
-install -m644 docs/dark-mode.png docs/settings.png "$bundle/docs/"
+install -m644 docs/*.md docs/screenshot.png "$bundle/docs/"
 if [[ -f LICENSE ]]; then install -m644 LICENSE "$bundle/LICENSE"; fi
 # Never copy .env or recursively copy the project/build tree.
 install -m644 .env.example "$bundle/.env.example"

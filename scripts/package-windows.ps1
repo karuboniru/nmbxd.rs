@@ -27,7 +27,7 @@ try {
         # Explicit allowlist: never copy credentials or the whole build tree.
         Copy-Item -LiteralPath $binary -Destination "$bundle/rdnmb.exe"
         Copy-Item README.md, .env.example -Destination $bundle
-        Copy-Item docs/dark-mode.png, docs/settings.png -Destination "$bundle/docs"
+        Copy-Item docs/*.md, docs/screenshot.png -Destination "$bundle/docs"
         Copy-Item assets/fonts/OFL.txt "$bundle/licenses/NotoColorEmoji-OFL.txt"
         Copy-Item vendor/cosmic-text/unicode/LICENSE.txt "$bundle/licenses/Unicode.txt"
         Copy-Item vendor/cosmic-text/LICENSE-MIT "$bundle/licenses/cosmic-text-MIT.txt"
