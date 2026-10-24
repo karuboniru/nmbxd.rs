@@ -798,10 +798,15 @@ impl Island {
             self.attachment = None;
             self.attachment_loading = false;
             self.attachment_revision += 1;
-            self.body
-                .update(cx, |input, cx| input.set_value("", window, cx));
-            self.title
-                .update(cx, |input, cx| input.set_value("", window, cx));
+            // A successful send hides the composer while its inputs are still
+            // disabled. Fresh states let the next quote insert immediately,
+            // before Input renders again, and discard the sent draft's undo history.
+            self.body = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .multi_line(true)
+                    .placeholder("在这里写下想说的话…")
+            });
+            self.title = cx.new(|cx| InputState::new(window, cx).placeholder("标题（可选）"));
             self.clear_draft = false;
         }
     }
