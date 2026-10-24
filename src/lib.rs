@@ -3,6 +3,7 @@ pub const APP_ID: &str = "org.niconi.rdnmb";
 pub const USER_AGENT: &str = concat!("rdnmb/", env!("CARGO_PKG_VERSION"));
 
 pub mod api;
+pub mod config_paths;
 pub mod content;
 pub mod history;
 pub mod model;

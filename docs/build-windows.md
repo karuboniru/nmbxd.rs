@@ -40,6 +40,6 @@ Get-FileHash .\rdnmb-版本-windows-x86_64.zip -Algorithm SHA256
 
 ## 配置与验证边界
 
-配置默认保存在 `%APPDATA%\rdnmb\settings.json` 和同目录的 `appearance.json`，也支持以绝对路径的 `XDG_CONFIG_HOME` 覆盖。本地历史位于配置目录中的 `history.sqlite3`，图片缓存位于 `media-cache/`。新版会迁移旧 `nmbxd` 设置；已有新版文件时优先使用新文件。
+配置默认保存在 `%APPDATA%\rdnmb\settings.json` 和同目录的 `appearance.json`，也支持以绝对路径的 `XDG_CONFIG_HOME` 覆盖。本地历史默认位于 `%LOCALAPPDATA%\rdnmb\history.sqlite3`，图片缓存默认位于 `%LOCALAPPDATA%\rdnmb\media-cache\`，分别支持绝对路径的 `XDG_DATA_HOME` 和 `XDG_CACHE_HOME` 覆盖。新版会迁移旧 `nmbxd` 设置，以及旧配置目录中的数据库和图片；旧文件保留，目标已有文件不会被覆盖。
 
 Windows 文件选择和图片另存为使用 rfd 原生对话框。虚拟机中的窗口渲染、中文输入、图片剪贴板和文件选择仍待实机验证；CI 仅构建及运行单元测试，不启动 GUI。构建成功不能代替桌面功能验证。

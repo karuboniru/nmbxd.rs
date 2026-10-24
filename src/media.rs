@@ -261,7 +261,17 @@ fn cache_generations() -> &'static CacheGenerations {
 }
 
 fn cache_directory() -> Option<PathBuf> {
-    crate::config_paths::paths("media-cache").map(|paths| paths.0)
+    static DIRECTORY: OnceLock<Option<PathBuf>> = OnceLock::new();
+    DIRECTORY
+        .get_or_init(|| {
+            let destination = crate::config_paths::cache_path("media-cache")?;
+            if let Some((current, legacy)) = crate::config_paths::paths("media-cache") {
+                // Cache migration is best effort; network loading can repopulate it.
+                let _ = crate::config_paths::migrate_media_cache(&destination, &[current, legacy]);
+            }
+            Some(destination)
+        })
+        .clone()
 }
 
 fn current_generation(value: &str) -> u64 {
@@ -321,7 +331,7 @@ fn read_cached(directory: &Path, url: &str) -> Option<Vec<u8>> {
 }
 
 // The caller has bounded and decoded these bytes. Cache failures are best effort:
-// a read-only config directory must not prevent an otherwise successful image.
+// a read-only cache directory must not prevent an otherwise successful image.
 fn write_cached(
     directory: &Path,
     url: &str,

@@ -84,6 +84,16 @@ const BROWSE_COLUMNS: &str = "b.thread_id, b.title, b.preview, b.forum_id, b.for
     b.visited_at, b.position, (SELECT COUNT(*) FROM cached_pages c WHERE c.thread_id = b.thread_id)";
 
 impl HistoryStore {
+    pub fn open_default() -> Result<Self> {
+        let path = crate::config_paths::data_path("history.sqlite3")
+            .context("cannot determine history data directory")?;
+        let sources = crate::config_paths::paths("history.sqlite3")
+            .map(|(current, legacy)| vec![current, legacy])
+            .unwrap_or_default();
+        migrate_history(&path, &sources)?;
+        Self::open(&path)
+    }
+
     /// Open a database file, creating its private parent directory if needed.
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -379,6 +389,69 @@ impl HistoryStore {
     }
 }
 
+/// Snapshot through SQLite so committed WAL pages are included. Never copy a
+/// live database and its sidecars independently, or replace an occupied target.
+fn migrate_history(destination: &Path, sources: &[std::path::PathBuf]) -> Result<()> {
+    if !history_destination_available(destination)? {
+        return Ok(());
+    }
+    for source in sources {
+        match fs::symlink_metadata(source) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error).context("inspect former history database"),
+        }
+        let connection =
+            Connection::open_with_flags(source, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .context("open former history database for migration")?;
+        connection.busy_timeout(Duration::from_secs(5))?;
+        let directory = destination.parent().context("history path has no parent")?;
+        let temporary = crate::config_paths::MigrationFile::new(directory)
+            .context("create temporary history snapshot")?;
+        #[cfg(unix)]
+        let snapshot_path = {
+            use std::os::unix::ffi::OsStrExt;
+            temporary.path().as_os_str().as_bytes()
+        };
+        #[cfg(not(unix))]
+        let snapshot_path = temporary
+            .path()
+            .to_str()
+            .context("history migration path is not valid UTF-8")?
+            .as_bytes();
+        let filename =
+            rusqlite::types::ToSqlOutput::Borrowed(rusqlite::types::ValueRef::Text(snapshot_path));
+        connection
+            .execute("VACUUM INTO ?1", [filename])
+            .context("snapshot former history database")?;
+        if history_destination_available(destination)? {
+            temporary
+                .publish(destination)
+                .context("publish migrated history database")?;
+        }
+        return Ok(());
+    }
+    Ok(())
+}
+
+fn history_destination_available(destination: &Path) -> Result<bool> {
+    match fs::symlink_metadata(destination) {
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("inspect history destination"),
+    }
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut sidecar = destination.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        match fs::symlink_metadata(Path::new(&sidecar)) {
+            Ok(_) => bail!("history database is absent but its {suffix} sidecar already exists"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("inspect history sidecar"),
+        }
+    }
+    Ok(true)
+}
+
 fn sqlite_id(id: u64) -> Result<i64> {
     i64::try_from(id).context("thread ID exceeds SQLite integer range")
 }
@@ -458,6 +531,103 @@ mod tests {
                 ..Post::default()
             }],
             ..Post::default()
+        }
+    }
+
+    #[test]
+    fn migration_snapshots_live_wal_without_removing_the_original() {
+        let db = TestDb::new();
+        fs::create_dir_all(&db.0).unwrap();
+        let source = db.0.join("old.sqlite3");
+        let connection = Connection::open(&source).unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+            CREATE TABLE sample(value TEXT); INSERT INTO sample VALUES ('committed in WAL');",
+            )
+            .unwrap();
+        assert!(fs::metadata(db.0.join("old.sqlite3-wal")).unwrap().len() > 0);
+        migrate_history(&db.path(), std::slice::from_ref(&source)).unwrap();
+        let migrated = Connection::open(db.path()).unwrap();
+        assert_eq!(
+            migrated
+                .query_row("SELECT value FROM sample", [], |row| row
+                    .get::<_, String>(0))
+                .unwrap(),
+            "committed in WAL"
+        );
+        assert!(source.is_file());
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM sample", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn migration_uses_current_then_legacy_and_preserves_existing_database() {
+        let db = TestDb::new();
+        fs::create_dir_all(&db.0).unwrap();
+        let current = db.0.join("rdnmb.sqlite3");
+        let legacy = db.0.join("nmbxd.sqlite3");
+        for (path, value) in [(&current, "current"), (&legacy, "legacy")] {
+            let connection = Connection::open(path).unwrap();
+            connection
+                .execute_batch("CREATE TABLE sample(value TEXT)")
+                .unwrap();
+            connection
+                .execute("INSERT INTO sample VALUES (?1)", [value])
+                .unwrap();
+        }
+        let sources = [current.clone(), legacy.clone()];
+        migrate_history(&db.path(), &sources).unwrap();
+        let value = |path: &Path| {
+            Connection::open(path)
+                .unwrap()
+                .query_row("SELECT value FROM sample", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap()
+        };
+        assert_eq!(value(&db.path()), "current");
+        migrate_history(&db.path(), std::slice::from_ref(&legacy)).unwrap();
+        assert_eq!(value(&db.path()), "current");
+        fs::remove_file(&current).unwrap();
+        let fallback = db.0.join("fallback.sqlite3");
+        migrate_history(&fallback, &sources).unwrap();
+        assert_eq!(value(&fallback), "legacy");
+    }
+
+    #[test]
+    fn failed_history_migration_leaves_no_partial_destination_or_temporary() {
+        let db = TestDb::new();
+        fs::create_dir_all(&db.0).unwrap();
+        let source = db.0.join("corrupt.sqlite3");
+        fs::write(&source, b"not a database").unwrap();
+        assert!(migrate_history(&db.path(), &[source]).is_err());
+        assert!(!db.path().exists());
+        assert!(!fs::read_dir(&db.0).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".rdnmb-migrate-")
+        }));
+    }
+
+    #[test]
+    fn orphan_destination_sidecars_are_preserved_and_block_migration() {
+        let db = TestDb::new();
+        fs::create_dir_all(&db.0).unwrap();
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let path = db.0.join(format!("history.sqlite3{suffix}"));
+            fs::write(&path, b"existing sidecar").unwrap();
+            assert!(migrate_history(&db.path(), &[]).is_err());
+            assert_eq!(fs::read(&path).unwrap(), b"existing sidecar");
+            assert!(!db.path().exists());
+            fs::remove_file(path).unwrap();
         }
     }
 

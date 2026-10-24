@@ -3,7 +3,6 @@
 mod appearance;
 mod assets;
 mod attachments;
-mod config_paths;
 mod cookies;
 mod drafts;
 mod emoji;
@@ -39,6 +38,7 @@ use navigation::{Navigation, PageAction, PageMode, parse_page};
 use rdnmb::{
     APP_ID, APP_NAME,
     api::ApiClient,
+    config_paths,
     history::{HistoryCategory, HistoryEntry, HistoryStore, PostingEntry, ReadingPosition},
     model::{ForumGroup, Post},
     tree::ThreadTree,
@@ -182,12 +182,9 @@ impl Island {
             }
         })
         .detach();
-        let (history, history_error) = match config_paths::paths("history.sqlite3") {
-            Some((path, _)) => match HistoryStore::open(&path) {
-                Ok(store) => (Some(store), None),
-                Err(error) => (None, Some(format!("本地历史不可用：{error}"))),
-            },
-            None => (None, Some("无法确定本地历史目录".to_owned())),
+        let (history, history_error) = match HistoryStore::open_default() {
+            Ok(store) => (Some(store), None),
+            Err(error) => (None, Some(format!("本地历史不可用：{error}"))),
         };
         cx.on_release(|this, _| this.save_reading_position())
             .detach();
