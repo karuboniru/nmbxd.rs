@@ -50,14 +50,27 @@ impl Island {
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         sidebar = sidebar.child(
-            div()
-                .px_3()
-                .pt_5()
-                .pb_2()
-                .text_xs()
-                .text_color(rgb(p.muted))
-                .child("时间线"),
+            button(
+                p,
+                "timeline-group",
+                if self.sidebar_sections.timelines {
+                    "▾ 时间线"
+                } else {
+                    "▸ 时间线"
+                },
+            )
+            .w_full()
+            .mt_3()
+            .mb_2()
+            .text_color(rgb(p.muted))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.sidebar_sections.timelines = !this.sidebar_sections.timelines;
+                cx.notify();
+            })),
         );
+        if !self.sidebar_sections.timelines {
+            return sidebar;
+        }
         for timeline in &self.timelines {
             let timeline = timeline.clone();
             let selected = !self.showing_history

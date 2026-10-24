@@ -25,6 +25,7 @@ mod reply_cookies;
 mod scrolling;
 mod selectable_content;
 mod settings;
+mod sidebar_sections;
 mod subscriptions;
 mod timeline_navigation;
 use appearance::{Appearance, Palette};
@@ -125,6 +126,7 @@ struct Island {
     title_drag: bool,
     tx: mpsc::Sender<Request>,
     groups: Vec<ForumGroup>,
+    sidebar_sections: sidebar_sections::SidebarSections,
     timelines: Vec<Timeline>,
     timeline: Option<Timeline>,
     timelines_loading: bool,
@@ -405,6 +407,7 @@ impl Island {
             title_drag: false,
             tx,
             groups: vec![],
+            sidebar_sections: sidebar_sections::SidebarSections::default(),
             timelines: vec![],
             timeline: None,
             timelines_loading: true,
@@ -1691,15 +1694,26 @@ impl Render for Island {
             .px_3();
         forums = self.timeline_sidebar(forums, p, cx);
         for group in &self.groups {
+            let group_id = group.id;
+            let expanded = self.sidebar_sections.forum_expanded(group_id);
             forums = forums.child(
-                div()
-                    .px_3()
-                    .pt_5()
-                    .pb_2()
-                    .text_xs()
-                    .text_color(rgb(p.muted))
-                    .child(group.name.clone()),
+                button(
+                    p,
+                    ("forum-group", group_id as u64),
+                    format!("{} {}", if expanded { "▾" } else { "▸" }, group.name),
+                )
+                .w_full()
+                .mt_3()
+                .mb_2()
+                .text_color(rgb(p.muted))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.sidebar_sections.toggle_forum(group_id);
+                    cx.notify();
+                })),
             );
+            if !expanded {
+                continue;
+            }
             for forum in &group.forums {
                 if forum.id <= 0 {
                     continue;
