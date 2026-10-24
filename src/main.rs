@@ -1087,9 +1087,6 @@ impl Island {
             .bg(rgb(p.surface))
             .border_b_1()
             .border_color(rgb(p.border))
-            .when(cfg!(target_os = "windows"), |d| {
-                d.window_control_area(WindowControlArea::Drag)
-            })
             .when(!cfg!(target_os = "windows"), |d| {
                 d.on_mouse_down(
                     MouseButton::Left,
@@ -1155,6 +1152,16 @@ impl Island {
             )
             .child(
                 div()
+                    .flex_1()
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    // GPUI 0.2.2 picks the first matching control hitbox, so a
+                    // Drag area on the header would mask its caption buttons.
+                    .when(cfg!(target_os = "windows"), |d| {
+                        d.window_control_area(WindowControlArea::Drag)
+                    })
                     .text_sm()
                     .font_weight(FontWeight::SEMIBOLD)
                     .child(APP_NAME),
