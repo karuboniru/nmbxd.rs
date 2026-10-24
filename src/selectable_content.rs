@@ -4,6 +4,7 @@
 //! while each frame's text element only supplies layout and mouse hit testing.
 use crate::appearance::Palette;
 use gpui::{prelude::*, *};
+use gpui_component::menu::{ContextMenuExt, PopupMenuItem};
 use rdnmb::content::{ContentLink, LinkTarget, ParsedContent};
 use std::{ops::Range, rc::Rc};
 
@@ -74,6 +75,7 @@ impl Render for SelectableContent {
                     },
                 )
             }));
+        let entity = cx.entity().downgrade();
         div()
             .id("selectable-content")
             .track_focus(&self.focus)
@@ -103,6 +105,19 @@ impl Render for SelectableContent {
                 selection: ordered_selection(&self.selection),
                 selection_color: rgb(palette.selected).into(),
                 entity: cx.entity().downgrade(),
+            })
+            .context_menu(move |menu, _, cx| {
+                let Some(entity) = entity.upgrade() else {
+                    return menu;
+                };
+                let content = entity.read(cx);
+                menu.action_context(content.focus.clone()).item(
+                    PopupMenuItem::new("复制")
+                        .disabled(content.selection.start == content.selection.end)
+                        .on_click(move |_, _, cx| {
+                            entity.update(cx, |content, cx| content.copy(cx));
+                        }),
+                )
             })
     }
 }

@@ -6,6 +6,14 @@ fn close_top_preview<T, I>(previews: &mut Vec<T>, viewing_image: &mut Option<I>)
     previews.pop().is_some() || viewing_image.take().is_some()
 }
 
+fn is_preview_escape(event: &KeystrokeEvent) -> bool {
+    event.keystroke.key == "escape"
+        && !event
+            .context_stack
+            .iter()
+            .any(|context| context.contains("PopupMenu"))
+}
+
 impl Island {
     /// Called from render; retain the subscription so registering once is enough.
     /// An interceptor also receives Escape when there is no focused element, or
@@ -22,7 +30,7 @@ impl Island {
         let window_id = window.window_handle().window_id();
         let listener = cx.listener(move |this, event: &KeystrokeEvent, window, cx| {
             if window.window_handle().window_id() == window_id
-                && event.keystroke.key == "escape"
+                && is_preview_escape(event)
                 && this.close_top_preview(cx)
             {
                 cx.stop_propagation();
@@ -58,7 +66,32 @@ impl Island {
 
 #[cfg(test)]
 mod tests {
-    use super::close_top_preview;
+    use super::{close_top_preview, is_preview_escape};
+    use gpui::{KeyContext, Keystroke, KeystrokeEvent};
+
+    #[test]
+    fn escape_dismisses_a_focused_menu_before_the_preview() {
+        let mut event = KeystrokeEvent {
+            keystroke: Keystroke::parse("escape").unwrap(),
+            action: None,
+            context_stack: vec![KeyContext::parse("PopupMenu").unwrap()],
+        };
+        let mut previews = vec![1, 2];
+        let mut image = Some("original-image");
+        if is_preview_escape(&event) {
+            close_top_preview(&mut previews, &mut image);
+        }
+        assert_eq!(previews, vec![1, 2]);
+        assert_eq!(image, Some("original-image"));
+
+        // Once Cancel returns focus to the text, the next Escape closes one layer.
+        event.context_stack.clear();
+        assert!(is_preview_escape(&event));
+        assert!(close_top_preview(&mut previews, &mut image));
+        assert_eq!(previews, vec![1]);
+        event.keystroke = Keystroke::parse("enter").unwrap();
+        assert!(!is_preview_escape(&event));
+    }
 
     #[test]
     fn closes_nested_messages_before_the_underlying_image() {
