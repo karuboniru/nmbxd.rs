@@ -337,7 +337,17 @@ impl Island {
             }
         })
         .detach();
-        let panes = panes::PaneLayout::new(cx);
+        let panes = panes::PaneLayout::new(
+            settings.pane_layout.clone(),
+            |this: &mut Self, layout, cx| {
+                this.settings.pane_layout = Some(layout.clone());
+                if let Err(error) = this.settings.save() {
+                    this.notice = format!("布局保存失败：{error}");
+                    cx.notify();
+                }
+            },
+            cx,
+        );
         let media = cx.new(|_| media::MediaStore::new());
         cx.observe(&media, |_, _, cx| cx.notify()).detach();
         let (reply_cookies, cookie_memory_error) = match reply_cookies::ReplyCookies::load() {
@@ -1127,7 +1137,9 @@ impl Island {
                 SettingsEvent::Save(settings) if !this.settings_saving => {
                     this.settings_saving = true;
                     panel.update(cx, |panel, cx| panel.set_saving(true, cx));
-                    if this.tx.send(Request::Configure(settings.clone())).is_err() {
+                    let mut settings = settings.clone();
+                    settings.pane_layout = this.settings.pane_layout.clone();
+                    if this.tx.send(Request::Configure(settings)).is_err() {
                         this.settings_saving = false;
                         panel.update(cx, |panel, cx| {
                             panel.set_error("后台服务不可用，请重启客户端", cx)

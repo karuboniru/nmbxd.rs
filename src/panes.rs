@@ -1,4 +1,4 @@
-//! Session-local pane widths and mouse-driven separators.
+//! Persistent pane widths and mouse-driven separators.
 use std::{cell::Cell, rc::Rc};
 
 use gpui::{prelude::*, *};
@@ -14,8 +14,17 @@ pub struct PaneLayout {
 }
 
 impl PaneLayout {
-    pub fn new<T: 'static>(cx: &mut Context<T>) -> Self {
-        let state = cx.new(|_| PaneState::default());
+    pub fn new<T: 'static>(
+        saved: Option<PanePreferences>,
+        on_save: impl Fn(&mut T, &PanePreferences, &mut Context<T>) + 'static,
+        cx: &mut Context<T>,
+    ) -> Self {
+        let state = cx.new(|_| PaneState {
+            sizes: PaneSizes::restore(saved),
+            ..Default::default()
+        });
+        cx.subscribe(&state, move |this, _, saved, cx| on_save(this, saved, cx))
+            .detach();
         cx.observe(&state, |_, _, cx| cx.notify()).detach();
         Self { state }
     }
@@ -58,6 +67,7 @@ impl PaneLayout {
             );
         }
         let state = self.state.clone();
+        let release_state = self.state.clone();
         div()
             .id("pane-columns")
             .relative()
@@ -78,7 +88,18 @@ impl PaneLayout {
                             }
                         });
                     },
-                    |_, _, _, _| {},
+                    move |_, _, window, _| {
+                        let state = release_state.clone();
+                        window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
+                            if phase.bubble() && event.button == MouseButton::Left {
+                                state.update(cx, |state, cx| {
+                                    if std::mem::take(&mut state.dirty) {
+                                        cx.emit(state.sizes.snapshot());
+                                    }
+                                });
+                            }
+                        });
+                    },
                 )
                 .absolute()
                 .size_full(),
@@ -122,6 +143,7 @@ impl PaneLayout {
                 state.update(cx, |state, cx| {
                     // The drag's starting widths prevent rounding and pointer drift.
                     state.sizes.resize(index, widths, delta);
+                    state.dirty = true;
                     cx.notify();
                 });
             })
@@ -131,8 +153,18 @@ impl PaneLayout {
 
 #[derive(Default)]
 struct PaneState {
+    dirty: bool,
     measured_width: f32,
     sizes: PaneSizes,
+}
+
+impl EventEmitter<PanePreferences> for PaneState {}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct PanePreferences {
+    widths: [f32; 4],
+    container: f32,
+    composing: bool,
 }
 
 struct PaneDrag {
@@ -162,6 +194,36 @@ impl Default for PaneSizes {
 }
 
 impl PaneSizes {
+    fn restore(saved: Option<PanePreferences>) -> Self {
+        match saved {
+            Some(saved)
+                if saved.container.is_finite()
+                    && saved.container > 0.
+                    && saved
+                        .widths
+                        .iter()
+                        .zip(MINIMUMS)
+                        .all(|(width, min)| width.is_finite() && *width >= min) =>
+            {
+                Self {
+                    widths: saved.widths,
+                    container: saved.container,
+                    composing: saved.composing,
+                    initialized: true,
+                }
+            }
+            _ => Self::default(),
+        }
+    }
+
+    fn snapshot(&self) -> PanePreferences {
+        PanePreferences {
+            widths: self.widths,
+            container: self.container,
+            composing: self.composing,
+        }
+    }
+
     fn prepare(&mut self, container: f32, composing: bool) {
         let count = if composing { 4 } else { 3 };
         let available =
@@ -241,6 +303,43 @@ mod tests {
 
     fn close(left: f32, right: f32) {
         assert!((left - right).abs() < 0.01, "{left} != {right}");
+    }
+
+    #[test]
+    fn saved_drag_restores_after_restart_and_composer_toggle() {
+        for composing in [false, true] {
+            let mut sizes = PaneSizes::default();
+            sizes.prepare(1400., composing);
+            sizes.resize(0, sizes.widths, 40.);
+            if composing {
+                sizes.resize(2, sizes.widths, 25.);
+            }
+            let json = serde_json::to_string(&sizes.snapshot()).unwrap();
+            let mut restored = PaneSizes::restore(Some(serde_json::from_str(&json).unwrap()));
+            restored.prepare(1400., false);
+            restored.prepare(1400., composing);
+            for (actual, expected) in restored.widths.into_iter().zip(sizes.widths) {
+                close(actual, expected);
+            }
+            restored.prepare(1800., composing);
+            close(
+                restored.widths[0] / restored.widths[1],
+                sizes.widths[0] / sizes.widths[1],
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_saved_dimensions_fall_back_to_defaults() {
+        for width in [f32::NAN, f32::INFINITY, -1., 0.] {
+            let restored = PaneSizes::restore(Some(PanePreferences {
+                widths: [width; 4],
+                container: 1400.,
+                composing: false,
+            }));
+            assert!(!restored.initialized);
+            assert_eq!(restored.widths, PaneSizes::default().widths);
+        }
     }
 
     #[test]

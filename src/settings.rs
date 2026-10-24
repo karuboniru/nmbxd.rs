@@ -44,6 +44,7 @@ pub struct Settings {
     pub ui_font_size: f32,
     pub thread_font_size: f32,
     pub body_font_size: f32,
+    pub pane_layout: Option<crate::panes::PanePreferences>,
 }
 
 impl Default for Settings {
@@ -59,6 +60,7 @@ impl Default for Settings {
             ui_font_size: DEFAULT_UI_FONT_SIZE,
             thread_font_size: DEFAULT_FONT_SIZE,
             body_font_size: DEFAULT_FONT_SIZE,
+            pane_layout: None,
         }
     }
 }
@@ -793,6 +795,7 @@ impl Render for SettingsPanel {
                                     ui_font_size,
                                     thread_font_size,
                                     body_font_size,
+                                    pane_layout: None,
                                 };
                                 this.set_saving(true, cx);
                                 cx.emit(SettingsEvent::Save(settings));
@@ -806,6 +809,29 @@ impl Render for SettingsPanel {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn pane_layout_round_trips_in_settings_and_old_files_use_defaults() {
+        let directory = std::env::temp_dir().join(format!("rdnmb-layout-{}", uuid::Uuid::new_v4()));
+        let path = directory.join("settings.json");
+        let mut settings = Settings::default();
+        let layout = serde_json::json!({
+            "widths": [210., 250., 600., 320.], "container": 1072., "composing": false
+        });
+        settings.pane_layout = Some(serde_json::from_value(layout.clone()).unwrap());
+        settings.save_to(&path).unwrap();
+        let loaded = Settings::load_from(&path).unwrap();
+        assert_eq!(serde_json::to_value(loaded.pane_layout).unwrap(), layout);
+        let mut json = serde_json::to_value(settings).unwrap();
+        json.as_object_mut().unwrap().remove("pane_layout");
+        assert!(
+            serde_json::from_value::<Settings>(json)
+                .unwrap()
+                .pane_layout
+                .is_none()
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     fn remove_saved_cookie(settings: &mut Settings, name: &str) {
         let saved = settings.cookies.clone();
