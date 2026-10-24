@@ -1,6 +1,8 @@
 # R岛 · rdnmb
 
-**R岛是 X 岛（nmbxd.com）的第三方桌面客户端，支持 Linux 和 Windows。**
+**R岛是 X 岛（nmbxd.com）的第三方桌面客户端，支持 Linux 和 Windows，并提供 macOS 实验性构建（Apple Silicon / Intel）。**
+
+**macOS 需要大家帮忙测试：维护者完全没有 Mac 测试设备。** macOS 二进制由 GitHub Actions 构建，尚未进行实机运行和 GUI 验证，不代表已确认可正常使用。欢迎下载试用并提交 issue，反馈 macOS 版本、芯片架构、应用版本和复现步骤；尤其需要验证标题栏、文件选择器、图片复制粘贴和中文输入。
 
 使用 **Rust + GPUI / gpui-component** 构建原生界面，基于 **reqwest** 访问 API，使用 **SQLite** 保存本地历史与阅读缓存。
 
@@ -35,6 +37,7 @@ https://publicapi.ovear.info/qrcode.php?w=500&text=eyJj...&base64=1
 
 - [Linux 构建、运行与打包](docs/build-linux.md)
 - [Windows 构建、运行与打包](docs/build-windows.md)
+- [macOS 实验性构建、运行与打包](docs/build-macos.md)
 - [GitHub Actions 与发布流程](docs/ci.md)
 - [使用说明与功能细节](docs/usage.md)
 - [技术说明、限制与验证记录](docs/technical.md)

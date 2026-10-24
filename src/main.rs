@@ -1112,22 +1112,31 @@ impl Island {
         if self.sending || self.attachment_loading {
             return false;
         }
-        let Some(image) = cx
+        // GPUI's macOS reader prefers text when the pasteboard offers both.
+        // Keep its broader image format support; only the explicit image
+        // action falls back to the native reader when GPUI returns no image.
+        // Ordinary paste keeps its text/image dispatch on every platform.
+        let image = cx
             .read_from_clipboard()
-            .and_then(attachments::clipboard_image)
-        else {
+            .and_then(attachments::clipboard_image);
+        let native_image = cfg!(target_os = "macos") && explicit && image.is_none();
+        if image.is_none() && !native_image {
             if explicit {
                 self.notice = "剪贴板中没有图片；可复制截图后粘贴，或使用选择图片".into();
                 cx.notify();
             }
             return false;
-        };
+        }
         self.attachment_loading = true;
         self.attachment_revision += 1;
         let revision = self.attachment_revision;
-        let task = cx
-            .background_executor()
-            .spawn(async move { attachments::load_clipboard(image) });
+        let task = cx.background_executor().spawn(async move {
+            #[cfg(target_os = "macos")]
+            if native_image {
+                return attachments::load_native_clipboard();
+            }
+            attachments::load_clipboard(image.expect("clipboard image checked above"))
+        });
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
@@ -1337,6 +1346,9 @@ impl Island {
             .items_center()
             .justify_between()
             .px_3()
+            // Match gpui-component's macOS title bar clearance for the native
+            // traffic lights without changing Linux/Windows header geometry.
+            .when(cfg!(target_os = "macos"), |d| d.pl(px(80.)))
             .bg(rgb(p.surface))
             .border_b_1()
             .border_color(rgb(p.border))
@@ -1351,6 +1363,9 @@ impl Island {
                     cx.listener(|this, event: &MouseUpEvent, window, cx| {
                         this.title_drag = false;
                         if event.click_count == 2 {
+                            #[cfg(target_os = "macos")]
+                            window.titlebar_double_click();
+                            #[cfg(not(target_os = "macos"))]
                             window.zoom_window();
                             cx.notify();
                         }
@@ -2476,6 +2491,8 @@ fn main() -> anyhow::Result<()> {
                     titlebar: Some(TitlebarOptions {
                         title: Some(APP_NAME.into()),
                         appears_transparent: true,
+                        #[cfg(target_os = "macos")]
+                        traffic_light_position: Some(point(px(9.), px(9.))),
                         ..Default::default()
                     }),
                     ..Default::default()
