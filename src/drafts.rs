@@ -12,11 +12,26 @@ impl Target {
         thread.map(Self::Reply).unwrap_or(Self::Forum(forum))
     }
 
-    pub fn can_send(self, selected: Option<u64>, forum: i64) -> bool {
+    /// Forum drafts belong to an explicitly selected, real posting forum.
+    /// Reading a different forum or timeline does not change that destination.
+    pub fn can_send(self, selected: Option<u64>, forums: impl IntoIterator<Item = i64>) -> bool {
         match self {
             Self::Reply(id) => selected == Some(id),
-            Self::Forum(id) => forum == id,
+            Self::Forum(id) => id > 0 && forums.into_iter().any(|forum| forum == id),
         }
+    }
+
+    pub fn select_forum(
+        self,
+        forum: i64,
+        sending: bool,
+        forums: impl IntoIterator<Item = i64>,
+    ) -> Option<Self> {
+        if sending || matches!(self, Self::Reply(_)) {
+            return None;
+        }
+        let target = Self::Forum(forum);
+        target.can_send(None, forums).then_some(target)
     }
 }
 
@@ -103,12 +118,41 @@ mod tests {
     }
 
     #[test]
-    fn send_guard_rejects_other_thread_or_forum() {
-        assert!(Target::Reply(10).can_send(Some(10), 4));
-        assert!(!Target::Reply(20).can_send(Some(10), 4));
-        assert!(!Target::Reply(20).can_send(None, 4));
-        assert!(Target::Forum(4).can_send(Some(10), 4));
-        assert!(!Target::Forum(4).can_send(Some(10), 5));
+    fn send_guard_validates_reply_or_explicit_posting_destination() {
+        assert!(Target::Reply(10).can_send(Some(10), [4, 5]));
+        assert!(!Target::Reply(20).can_send(Some(10), [4, 5]));
+        assert!(!Target::Reply(20).can_send(None, [4, 5]));
+        assert!(Target::Forum(4).can_send(Some(10), [4, 5]));
+        assert!(!Target::Forum(4).can_send(Some(10), [5]));
+        assert!(Target::Forum(5).can_send(None, [4, 5]));
+        assert!(!Target::Forum(0).can_send(None, [0, 4]));
+        assert!(!Target::Forum(-1).can_send(None, [-1, 4]));
         assert_eq!(Target::new(Some(10), 999), Target::Reply(10));
+    }
+
+    #[test]
+    fn destination_switch_preserves_all_draft_fields_and_rejects_replies_or_sends() {
+        let from = Target::Forum(4);
+        let to = from.select_forum(5, false, [4, 5]).unwrap();
+        assert_eq!(to, Target::Forum(5));
+        assert_eq!(from.select_forum(7, false, [4, 5]), None);
+        assert_eq!(from.select_forum(5, true, [4, 5]), None);
+        assert_eq!(Target::Reply(4).select_forum(5, false, [4, 5]), None);
+        let mut drafts = Drafts::default();
+        assert_eq!(
+            drafts.switch(from, to, ("body", "title", "image", "cookie"), || (
+                "", "", "", ""
+            )),
+            ("", "", "", "")
+        );
+        assert_eq!(
+            drafts.switch(
+                to,
+                from,
+                ("other", "", "", "other cookie"),
+                || unreachable!()
+            ),
+            ("body", "title", "image", "cookie")
+        );
     }
 }

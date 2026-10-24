@@ -804,10 +804,7 @@ impl Island {
     }
 
     pub(crate) fn reader_target_changed(&mut self) {
-        if !drafts::Target::new(self.compose_target, self.compose_forum).can_send(
-            self.selected,
-            timeline_navigation::posting_forum(self.timeline.as_ref(), self.forum),
-        ) {
+        if !self.composer_can_send() {
             self.composing = false;
             self.kaomoji_open = false;
         }
@@ -820,12 +817,23 @@ impl Island {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let forum = timeline_navigation::posting_forum(self.timeline.as_ref(), self.forum);
+        self.compose_to(target, forum, quote, window, cx);
+    }
+
+    fn compose_to(
+        &mut self,
+        target: Option<u64>,
+        forum: i64,
+        quote: Option<u64>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.sending {
             return;
         }
         self.clear_current_draft(window, cx);
         let from = drafts::Target::new(self.compose_target, self.compose_forum);
-        let forum = timeline_navigation::posting_forum(self.timeline.as_ref(), self.forum);
         let to = drafts::Target::new(target, forum);
         if from != to {
             // In-flight file/clipboard reads must never attach to the next draft.
@@ -855,14 +863,9 @@ impl Island {
         }
         self.compose_target = target;
         self.compose_forum = forum;
-        self.compose_label = target.map(|id| format!("回复 No.{id}")).unwrap_or_else(|| {
-            let name = if self.timeline.is_some() {
-                "综合版1"
-            } else {
-                &self.forum_name
-            };
-            format!("发串到 {name}")
-        });
+        self.compose_label = target
+            .map(|id| format!("回复 No.{id}"))
+            .unwrap_or_else(|| format!("发串到 {}", self.posting_forum_name(forum)));
         if let Some(id) = quote {
             let current = self.body.read(cx).value();
             let suffix = drafts::quote_suffix(&current, id);
@@ -879,6 +882,98 @@ impl Island {
         self.body.update(cx, |input, cx| input.focus(window, cx));
         cx.notify();
     }
+    fn posting_forums(&self) -> impl Iterator<Item = i64> + '_ {
+        self.groups
+            .iter()
+            .flat_map(|group| &group.forums)
+            .map(|forum| forum.id)
+            .filter(|id| *id > 0)
+            // 综合版1 is the known startup destination while metadata is unavailable.
+            .chain(self.groups.is_empty().then_some(4))
+    }
+
+    fn composer_can_send(&self) -> bool {
+        drafts::Target::new(self.compose_target, self.compose_forum)
+            .can_send(self.selected, self.posting_forums())
+    }
+
+    fn posting_forum_name(&self, id: i64) -> String {
+        self.groups
+            .iter()
+            .flat_map(|group| &group.forums)
+            .find(|forum| forum.id == id)
+            .map(|forum| forum.display_name())
+            .unwrap_or_else(|| {
+                if id == 4 {
+                    "综合版1".into()
+                } else {
+                    format!("板块 {id}")
+                }
+            })
+    }
+
+    fn composer_heading(&self, p: Palette, cx: &mut Context<Self>) -> AnyElement {
+        if self.compose_target.is_some() {
+            return heading(p, "WRITE / 写点什么", self.compose_label.clone()).into_any_element();
+        }
+        let mut seen = HashSet::new();
+        let forums: Vec<_> = self
+            .groups
+            .iter()
+            .flat_map(|group| &group.forums)
+            .filter(|forum| forum.id > 0 && seen.insert(forum.id))
+            .map(|forum| (forum.id, forum.display_name()))
+            .collect();
+        let selected = self.compose_forum;
+        let view = cx.entity();
+        div()
+            .p_5()
+            .border_b_1()
+            .border_color(rgb(p.border))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(p.muted))
+                    .child("WRITE / 写点什么"),
+            )
+            .child(
+                Button::new("posting-forum")
+                    .mt_2()
+                    .label(format!("发串到 {} ▾", self.posting_forum_name(selected)))
+                    .disabled(self.sending || forums.is_empty())
+                    .dropdown_menu(move |mut menu, _, _| {
+                        for (id, name) in &forums {
+                            let id = *id;
+                            let view = view.clone();
+                            menu = menu.item(
+                                PopupMenuItem::new(name.clone())
+                                    .checked(selected == id)
+                                    .on_click(move |_, window, cx| {
+                                        view.update(cx, |this, cx| {
+                                            let current = drafts::Target::new(
+                                                this.compose_target,
+                                                this.compose_forum,
+                                            );
+                                            if current
+                                                .select_forum(
+                                                    id,
+                                                    this.sending,
+                                                    this.posting_forums(),
+                                                )
+                                                .is_some()
+                                            {
+                                                this.compose_to(None, id, None, window, cx);
+                                            }
+                                        });
+                                    }),
+                            );
+                        }
+                        menu
+                    }),
+            )
+            .into_any_element()
+    }
+
     fn posting_cookie_name(&self) -> Option<&str> {
         self.compose_cookie
             .as_deref()
@@ -927,13 +1022,8 @@ impl Island {
         if self.sending || self.attachment_loading || !self.composing {
             return;
         }
-        if self.clear_draft
-            || !drafts::Target::new(self.compose_target, self.compose_forum).can_send(
-                self.selected,
-                timeline_navigation::posting_forum(self.timeline.as_ref(), self.forum),
-            )
-        {
-            self.notice = "已阻止发送：草稿目标与当前浏览目标不一致，请在目标串重新点击回复".into();
+        if self.clear_draft || !self.composer_can_send() {
+            self.notice = "已阻止发送：请检查发串板块，或在目标串重新点击回复".into();
             cx.notify();
             return;
         }
@@ -1611,7 +1701,7 @@ impl Render for Island {
                     .child(group.name.clone()),
             );
             for forum in &group.forums {
-                if forum.id < 0 {
+                if forum.id <= 0 {
                     continue;
                 }
                 let id = forum.id;
@@ -2095,7 +2185,7 @@ impl Render for Island {
                 .bg(rgb(p.surface))
                 .border_l_1()
                 .border_color(rgb(p.border))
-                .child(heading(p, "WRITE / 写点什么", self.compose_label.clone()))
+                .child(self.composer_heading(p, cx))
                 .child(div().px_4().child(self.cookie_dropdown(cx)))
                 .child(
                     div()
