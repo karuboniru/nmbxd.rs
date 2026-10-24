@@ -1,12 +1,16 @@
-param([switch]$SkipBuild)
+param(
+    [switch]$SkipBuild,
+    [ValidateSet('x86_64-pc-windows-msvc', 'aarch64-pc-windows-msvc')]
+    [string]$Target = 'x86_64-pc-windows-msvc'
+)
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 Push-Location (Split-Path $PSScriptRoot -Parent)
 try {
-    $target = 'x86_64-pc-windows-msvc'
+    $arch = $Target.Split('-')[0]
     if (!$SkipBuild) {
-        cargo build --release --locked -p rdnmb --target $target
+        cargo build --release --locked -p rdnmb --target $Target
         if ($LASTEXITCODE -ne 0) { throw 'Release build failed' }
     }
     $metadataJson = cargo metadata --no-deps --format-version 1 --locked
@@ -15,8 +19,8 @@ try {
     $package = $metadata.packages | Where-Object { $_.name -eq 'rdnmb' }
     $version = $package.version
     if ($version -notmatch '^[A-Za-z0-9._+-]+$') { throw 'Invalid package version' }
-    $name = "rdnmb-$version-windows-x86_64"
-    $binary = Join-Path $metadata.target_directory "$target/release/rdnmb.exe"
+    $name = "rdnmb-$version-windows-$arch"
+    $binary = Join-Path $metadata.target_directory "$Target/release/rdnmb.exe"
     if (!(Test-Path -LiteralPath $binary -PathType Leaf)) { throw "Missing executable: $binary" }
 
     New-Item -ItemType Directory -Force -Path dist | Out-Null

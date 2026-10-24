@@ -18,8 +18,16 @@ env:
 
 jobs:
   build:
-    name: Linux x86_64 (Ubuntu 24.04)
-    runs-on: ubuntu-24.04
+    name: Linux ${{ matrix.arch }} (Ubuntu 24.04)
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps:
       - name: Check out source
@@ -52,10 +60,10 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target/release
-          key: linux-x86_64-ubuntu24-rust-${{ steps.rust.outputs.version }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'vendor/**/Cargo.toml') }}-${{ github.sha }}
+          key: linux-${{ matrix.arch }}-ubuntu24-rust-${{ steps.rust.outputs.version }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'vendor/**/Cargo.toml') }}-${{ github.sha }}
           restore-keys: |
-            linux-x86_64-ubuntu24-rust-${{ steps.rust.outputs.version }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'vendor/**/Cargo.toml') }}-
-            linux-x86_64-ubuntu24-rust-${{ steps.rust.outputs.version }}-
+            linux-${{ matrix.arch }}-ubuntu24-rust-${{ steps.rust.outputs.version }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'vendor/**/Cargo.toml') }}-
+            linux-${{ matrix.arch }}-ubuntu24-rust-${{ steps.rust.outputs.version }}-
 
       # Pure unit tests: no desktop session, cookie, or live posting required.
       # Use the release profile for tests too, reusing the expensive GPUI build.
@@ -74,7 +82,7 @@ jobs:
       - name: Upload downloadable build
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: rdnmb-linux-x86_64-${{ github.sha }}
+          name: rdnmb-linux-${{ matrix.arch }}-${{ github.sha }}
           path: |
             dist/*.tar.gz
             dist/*.tar.gz.sha256
@@ -83,14 +91,24 @@ jobs:
           retention-days: 30
 
   build-windows:
-    name: Windows x86_64 (MSVC)
-    runs-on: windows-2022
+    name: Windows ${{ matrix.arch }} (MSVC)
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: windows-2022
+            target: x86_64-pc-windows-msvc
+          - arch: aarch64
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     defaults:
       run:
         shell: pwsh
     env:
-      CARGO_BUILD_TARGET: x86_64-pc-windows-msvc
+      CARGO_BUILD_TARGET: ${{ matrix.target }}
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -127,11 +145,11 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target/release
-            target/x86_64-pc-windows-msvc/release
-          key: windows-x86_64-msvc-2022-rust-${{ steps.rust.outputs.version }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'vendor/**/Cargo.toml') }}-${{ github.sha }}
+            target/${{ matrix.target }}/release
+          key: windows-${{ matrix.arch }}-msvc-${{ matrix.runner }}-rust-${{ steps.rust.outputs.version }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'vendor/**/Cargo.toml') }}-${{ github.sha }}
           restore-keys: |
-            windows-x86_64-msvc-2022-rust-${{ steps.rust.outputs.version }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'vendor/**/Cargo.toml') }}-
-            windows-x86_64-msvc-2022-rust-${{ steps.rust.outputs.version }}-
+            windows-${{ matrix.arch }}-msvc-${{ matrix.runner }}-rust-${{ steps.rust.outputs.version }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'vendor/**/Cargo.toml') }}-
+            windows-${{ matrix.arch }}-msvc-${{ matrix.runner }}-rust-${{ steps.rust.outputs.version }}-
 
       - name: Run unit tests
         run: cargo test --release --locked -p rdnmb
@@ -140,12 +158,12 @@ jobs:
         run: cargo build --release --locked -p rdnmb
 
       - name: Package Windows distribution
-        run: ./scripts/package-windows.ps1 -SkipBuild
+        run: ./scripts/package-windows.ps1 -SkipBuild -Target $env:CARGO_BUILD_TARGET
 
       - name: Upload downloadable build
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: rdnmb-windows-x86_64-${{ github.sha }}
+          name: rdnmb-windows-${{ matrix.arch }}-${{ github.sha }}
           path: |
             dist/*.zip
             dist/*.zip.sha256
