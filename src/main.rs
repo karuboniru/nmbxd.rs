@@ -25,6 +25,8 @@ mod reply_cookies;
 mod scrolling;
 mod selectable_content;
 mod settings;
+mod share_links;
+mod share_ui;
 mod sidebar_sections;
 mod subscriptions;
 mod timeline_navigation;
@@ -144,6 +146,9 @@ struct Island {
     selected: Option<u64>,
     navigation: Navigation,
     page_input: Entity<InputState>,
+    open_input: Entity<InputState>,
+    open_link_panel: bool,
+    open_error: Option<String>,
     reading_revision: u64,
     reading_scroll: ScrollHandle,
     reading_paging: ScrollPaging,
@@ -349,6 +354,14 @@ impl Island {
         tx.send(Request::Forums).ok();
         tx.send(Request::Timelines).ok();
         tx.send(Request::Forum(1, 4, 1)).ok();
+        let open_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("链接 / 串号 / 消息 ID"));
+        cx.subscribe(&open_input, |this, _, event, cx| {
+            if matches!(event, InputEvent::PressEnter { .. }) {
+                this.open_shared(None, cx);
+            }
+        })
+        .detach();
         let page_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("页码")
@@ -430,6 +443,9 @@ impl Island {
             selected: None,
             navigation: Navigation::default(),
             page_input,
+            open_input,
+            open_link_panel: false,
+            open_error: None,
             reading_revision: 0,
             reading_scroll: ScrollHandle::new(),
             reading_paging: ScrollPaging::default(),
@@ -1189,7 +1205,13 @@ impl Island {
                     .justify_between()
                     .text_xs()
                     .text_color(rgb(p.muted))
-                    .child(format!("{}  ·  No.{}", post.user_hash, id))
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(post.user_hash.clone())
+                            .child(self.number_button(("post-number", id), id, cx)),
+                    )
                     .child(post.now.to_string()),
             )
             .when(post.title != "无标题" && !post.title.is_empty(), |d| {
@@ -1256,6 +1278,7 @@ impl Island {
                         d.child(self.image_actions(("post-image-actions", id), url, cx))
                     })
                     .child(self.copy_text_button(("copy-post", id), &post.content, cx))
+                    .child(self.copy_link_button(("copy-post-link", id), id, self.selected, cx))
                     .child(button(p, ("quote", id), "引用回复").on_click(cx.listener(
                         move |this, _, window, cx| {
                             this.compose(this.selected, Some(id), window, cx)
@@ -1388,10 +1411,28 @@ impl Island {
             })
             .child(
                 div()
-                    .w(px(240.))
+                    .min_w(px(240.))
                     .flex()
                     .items_center()
                     .gap_2()
+                    .child(
+                        button(p, "open-link", "打开…")
+                            .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                                window.prevent_default();
+                                cx.stop_propagation();
+                            })
+                            .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.open_link_panel = !this.open_link_panel;
+                                this.open_error = None;
+                                if this.open_link_panel {
+                                    this.open_input
+                                        .update(cx, |input, cx| input.focus(window, cx));
+                                }
+                                cx.notify();
+                            })),
+                    )
                     .child(
                         button(p, "settings", "设置")
                             .on_mouse_down(MouseButton::Left, |_, window, cx| {
@@ -1852,7 +1893,10 @@ impl Render for Island {
                             div()
                                 .text_xs()
                                 .text_color(rgb(p.muted))
-                                .child(format!("No.{}  ·  {} 回复", id, post.reply_count)),
+                                .flex()
+                                .gap_2()
+                                .child(self.number_button(("list-number", id), id, cx))
+                                .child(format!("· {} 回复", post.reply_count)),
                         )
                         .child(
                             div()
@@ -1896,7 +1940,19 @@ impl Render for Island {
                             let state = view.read(cx);
                             let add = !state.subscribed.contains(&id);
                             let pending = state.subscription_pending.contains(&id);
-                            menu.item(
+                            let copy_number_view = view.clone();
+                            let copy_link_view = view.clone();
+                            menu.item(PopupMenuItem::new("复制串号").on_click(move |_, _, cx| {
+                                copy_number_view.update(cx, |this, cx| this.copy_number(id, cx));
+                            }))
+                            .item(PopupMenuItem::new("复制链接").on_click(move |_, _, cx| {
+                                copy_link_view.update(cx, |this, cx| {
+                                    let url =
+                                        share_links::thread_url(&this.settings.website_base, id);
+                                    this.copy_link(url, cx);
+                                });
+                            }))
+                            .item(
                                 PopupMenuItem::new(if add {
                                     "添加订阅"
                                 } else {
@@ -2132,13 +2188,22 @@ impl Render for Island {
             .h_full()
             .flex()
             .flex_col()
-            .child(heading(
-                p,
-                "THREAD / 阅读",
-                self.selected
-                    .map(|id| format!("No.{id}"))
-                    .unwrap_or("此刻，岛上".into()),
-            ))
+            .child(
+                div()
+                    .p_5()
+                    .border_b_1()
+                    .border_color(rgb(p.border))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(p.muted))
+                            .child("THREAD / 阅读"),
+                    )
+                    .child(div().mt_2().text_lg().child(match self.selected {
+                        Some(id) => self.number_button("reader-number", id, cx),
+                        None => div().child("此刻，岛上").into_any_element(),
+                    })),
+            )
             .child(
                 div()
                     .flex()
@@ -2155,6 +2220,9 @@ impl Render for Island {
                     .px_4()
                     .py_2()
                     .gap_2()
+                    .when_some(self.selected, |d, id| {
+                        d.child(self.copy_link_button("copy-thread-link", id, Some(id), cx))
+                    })
                     .child(
                         button(p, "chronological", "时间顺序")
                             .when(!self.aggregate, |d| d.bg(rgb(p.selected)))
@@ -2407,6 +2475,7 @@ impl Render for Island {
             .font_family(self.settings.font_family.clone())
             .text_size(px(self.settings.ui_font_size))
             .child(self.header(window, cx))
+            .when(self.open_link_panel, |d| d.child(self.share_open_panel(cx)))
             .child(if let Some(panel) = &self.settings_panel {
                 div()
                     .flex_1()

@@ -160,6 +160,7 @@ pub(crate) struct Frame {
     lifetime: std::sync::Arc<()>,
     generation: u64,
     id: u64,
+    thread_hint: Option<u64>,
     value: Option<ReferencePreview>,
     error: Option<String>,
     busy: bool,
@@ -394,7 +395,7 @@ impl Island {
         None
     }
 
-    fn open_preview(&mut self, id: u64, cx: &mut Context<Self>) {
+    pub(crate) fn open_preview(&mut self, id: u64, cx: &mut Context<Self>) {
         if let Some(index) = self.previews.iter().position(|frame| frame.id == id) {
             self.previews.truncate(index + 1);
             cx.notify();
@@ -415,6 +416,7 @@ impl Island {
             lifetime,
             generation,
             id,
+            thread_hint: None,
             value,
             error: None,
             busy,
@@ -429,6 +431,12 @@ impl Island {
             self.receive_preview(generation, Err("请求服务已停止".into()));
         }
         cx.notify();
+    }
+
+    pub(crate) fn set_preview_thread_hint(&mut self, thread: Option<u64>) {
+        if let Some(frame) = self.previews.last_mut() {
+            frame.thread_hint = thread;
+        }
     }
 
     pub(crate) fn receive_preview(
@@ -463,7 +471,8 @@ impl Island {
         let root = self
             .local_reference(id)
             .and_then(|v| v.thread_id)
-            .or_else(|| frame.value.as_ref().and_then(|v| v.thread_id));
+            .or_else(|| frame.value.as_ref().and_then(|v| v.thread_id))
+            .or(frame.thread_hint);
         // A current-thread reference is a true noop: retain scroll, pages,
         // aggregation state, draft, and even the preview stack.
         if root == self.selected && root.is_some() {
@@ -545,6 +554,7 @@ impl Island {
             .local_reference(frame.id)
             .and_then(|v| v.thread_id)
             .or_else(|| frame.value.as_ref().and_then(|v| v.thread_id))
+            .or(frame.thread_hint)
             == self.selected
             && self.selected.is_some();
         let mut body = div()
@@ -580,6 +590,12 @@ impl Island {
             body = body.child(self.copy_text_button(
                 ("copy-preview", generation),
                 &value.post.content,
+                cx,
+            ));
+            body = body.child(self.copy_link_button(
+                ("copy-preview-link", generation),
+                value.post.id,
+                value.thread_id.or(frame.thread_hint),
                 cx,
             ));
             if let Some(url) = value.post.image_url(true) {
@@ -675,11 +691,19 @@ impl Island {
                                     cx.notify();
                                 },
                             )))
-                            .child(div().flex_1().child(format!(
-                                "引用预览 No.{} · 第 {} 层",
-                                frame.id,
-                                self.previews.len()
-                            )))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .flex()
+                                    .gap_2()
+                                    .child("引用预览")
+                                    .child(self.number_button(
+                                        ("preview-number", generation),
+                                        frame.id,
+                                        cx,
+                                    ))
+                                    .child(format!("· 第 {} 层", self.previews.len())),
+                            )
                             .child(
                                 button(
                                     p,

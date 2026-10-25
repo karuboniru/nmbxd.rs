@@ -56,6 +56,7 @@ impl Island {
 
     fn close_top_preview(&mut self, cx: &mut Context<Self>) -> bool {
         let closed = close_top_preview(&mut self.previews, &mut self.viewing_image)
+            || std::mem::take(&mut self.open_link_panel)
             || (self.composing && std::mem::take(&mut self.kaomoji_open));
         if closed {
             cx.notify();
