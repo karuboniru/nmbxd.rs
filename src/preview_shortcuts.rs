@@ -3,7 +3,7 @@ use gpui::{Context, KeystrokeEvent, MouseButton, MouseDownEvent, NavigationDirec
 
 /// Close exactly one layer, keeping any underlying preview intact.
 fn close_top_preview<T, I>(previews: &mut Vec<T>, viewing_image: &mut Option<I>) -> bool {
-    previews.pop().is_some() || viewing_image.take().is_some()
+    viewing_image.take().is_some() || previews.pop().is_some()
 }
 
 fn is_preview_escape(event: &KeystrokeEvent) -> bool {
@@ -88,26 +88,26 @@ mod tests {
         event.context_stack.clear();
         assert!(is_preview_escape(&event));
         assert!(close_top_preview(&mut previews, &mut image));
-        assert_eq!(previews, vec![1]);
+        assert_eq!(previews, vec![1, 2]);
+        assert!(image.is_none());
         event.keystroke = Keystroke::parse("enter").unwrap();
         assert!(!is_preview_escape(&event));
     }
 
     #[test]
-    fn closes_nested_messages_before_the_underlying_image() {
+    fn closes_image_before_returning_through_nested_messages() {
         let mut previews = vec![1, 2];
         let mut image = Some("original-image".to_owned());
 
         assert!(close_top_preview(&mut previews, &mut image));
+        assert_eq!(previews, vec![1, 2]);
+        assert!(image.is_none());
+
+        assert!(close_top_preview(&mut previews, &mut image));
         assert_eq!(previews, vec![1]);
-        assert_eq!(image.as_deref(), Some("original-image"));
 
         assert!(close_top_preview(&mut previews, &mut image));
         assert!(previews.is_empty());
-        assert_eq!(image.as_deref(), Some("original-image"));
-
-        assert!(close_top_preview(&mut previews, &mut image));
-        assert!(image.is_none());
         assert!(!close_top_preview(&mut previews, &mut image));
     }
 }

@@ -254,9 +254,6 @@ impl Island {
                                             return;
                                         }
                                         let _ = entity.update(cx, |this, cx| {
-                                            if !this.previews.is_empty() {
-                                                return;
-                                            }
                                             if let Some(viewer) = this.viewing_image.as_mut()
                                                 && viewer.transform.drag.is_some()
                                             {
@@ -586,8 +583,27 @@ impl Island {
                 cx,
             ));
             if let Some(url) = value.post.image_url(true) {
-                body = body.child(media_view::tile(&self.media, url, px(240.), cx));
                 if let Some(original) = value.post.image_url(false) {
+                    let image_url = original.clone();
+                    body = body.child(
+                        div()
+                            .id(("preview-image", generation))
+                            .my_2()
+                            .cursor_pointer()
+                            .child(media_view::tile(&self.media, url, px(240.), cx))
+                            .child(
+                                div()
+                                    .mt_1()
+                                    .text_xs()
+                                    .text_color(rgb(p.muted))
+                                    .child("点击查看原图"),
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.viewing_image = Some(ImageViewer::new(image_url.clone()));
+                                cx.notify();
+                            })),
+                    );
                     body = body.child(self.image_actions(
                         ("preview-image-actions", generation),
                         original,

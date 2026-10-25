@@ -2436,9 +2436,10 @@ impl Render for Island {
                     .child(self.notice.clone()),
             )
             .relative()
-            .when(!self.previews.is_empty(), |d| {
-                d.child(self.preview_overlay(cx))
-            })
+            .when(
+                !self.previews.is_empty() && self.viewing_image.is_none(),
+                |d| d.child(self.preview_overlay(cx)),
+            )
     }
 }
 
