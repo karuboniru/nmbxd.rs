@@ -276,14 +276,13 @@ impl Island {
                         let result =
                             ApiClient::with_website_base(Some(&cookie_value), api.website_base())
                                 .and_then(|posting_api| match target {
-                                    Some(id) => posting_api.reply_with_image(
-                                        id,
-                                        "",
-                                        &title,
-                                        &body,
-                                        image.as_ref(),
-                                    ),
-                                    None => posting_api.post_thread_with_image(
+                                    Some(id) => posting_api
+                                        .reply_with_image(id, "", &title, &body, image.as_ref())
+                                        .map(|message| rdnmb::api::PostingResult {
+                                            message,
+                                            thread_id: Some(id),
+                                        }),
+                                    None => posting_api.post_thread_with_image_result(
                                         fid,
                                         "",
                                         &title,
@@ -293,18 +292,19 @@ impl Island {
                                 })
                                 .map_err(|e| e.to_string());
                         // Capture the exact submitted draft, not the current editor state.
-                        let history_error = if let Ok(message) = &result {
+                        let history_error = if let Ok(posted) = &result {
                             if let Some(store) = &posting_history {
                                 store
                                     .record_post(&PostingEntry {
                                         id: 0,
                                         target,
+                                        thread_id: posted.thread_id,
                                         forum_id: fid,
                                         title,
                                         body,
                                         has_image: image.is_some(),
                                         sent_at: rdnmb::history::now_millis(),
-                                        message: message.clone(),
+                                        message: posted.message.clone(),
                                     })
                                     .err()
                                     .map(|error| error.to_string())
@@ -314,7 +314,12 @@ impl Island {
                         } else {
                             None
                         };
-                        Response::Sent(result, history_error, target, cookie_name)
+                        Response::Sent(
+                            result.map(|posted| posted.message),
+                            history_error,
+                            target,
+                            cookie_name,
+                        )
                     }
                 };
                 if out.send(result).is_err() {

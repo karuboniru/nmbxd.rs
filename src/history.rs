@@ -53,7 +53,10 @@ pub struct BrowseEntry {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PostingEntry {
     pub id: i64,
+    /// The thread being replied to; `None` identifies a new thread submission.
     pub target: Option<u64>,
+    /// Confirmed destination of a successful submission, when available.
+    pub thread_id: Option<u64>,
     pub forum_id: i64,
     pub title: String,
     pub body: String,
@@ -135,7 +138,7 @@ impl HistoryStore {
         let version: u32 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .context("read history schema version")?;
-        if version > 1 {
+        if version > 2 {
             bail!("history database schema is newer than this application supports");
         }
         if version == 0 {
@@ -159,15 +162,29 @@ impl HistoryStore {
                 );
                 CREATE TABLE posting (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    target INTEGER CHECK(target >= 0), forum_id INTEGER NOT NULL,
+                    target INTEGER CHECK(target >= 0),
+                    thread_id INTEGER CHECK(thread_id >= 0), forum_id INTEGER NOT NULL,
                     title TEXT NOT NULL, body TEXT NOT NULL, has_image INTEGER NOT NULL,
                     sent_at INTEGER NOT NULL, message TEXT NOT NULL
                 );
                 CREATE INDEX posting_by_send ON posting(sent_at DESC, id DESC);
-                PRAGMA user_version = 1;",
+                PRAGMA user_version = 2;",
                 )
                 .context("initialize history tables")?;
             transaction.commit().context("commit history migration")?;
+        } else if version == 1 {
+            let transaction = connection
+                .transaction()
+                .context("begin posting destination migration")?;
+            transaction
+                .execute_batch(
+                    "ALTER TABLE posting ADD COLUMN thread_id INTEGER CHECK(thread_id >= 0);
+                     PRAGMA user_version = 2;",
+                )
+                .context("add posting thread destination")?;
+            transaction
+                .commit()
+                .context("commit posting destination migration")?;
         }
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
@@ -339,7 +356,7 @@ impl HistoryStore {
                 };
                 let mut statement = connection
                     .prepare(&format!(
-                        "SELECT id, target, forum_id, title, body, has_image, sent_at, message
+                        "SELECT id, target, forum_id, title, body, has_image, sent_at, message, thread_id
                      FROM posting WHERE target {target_filter}
                      ORDER BY sent_at DESC, id DESC LIMIT ?1 OFFSET ?2",
                     ))
@@ -358,6 +375,10 @@ impl HistoryStore {
                             has_image: row.get(5)?,
                             sent_at: row.get(6)?,
                             message: row.get(7)?,
+                            thread_id: row
+                                .get::<_, Option<i64>>(8)?
+                                .map(|id| unsigned_id(id, 8))
+                                .transpose()?,
                         }))
                     })
                     .context("list posting history")?
@@ -370,10 +391,11 @@ impl HistoryStore {
     /// Append one confirmed successful submission. `id` is assigned by SQLite.
     pub fn record_post(&self, entry: &PostingEntry) -> Result<()> {
         let target = entry.target.map(sqlite_id).transpose()?;
+        let thread_id = entry.thread_id.map(sqlite_id).transpose()?;
         self.connection()?
             .execute(
-                "INSERT INTO posting(target, forum_id, title, body, has_image, sent_at, message)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO posting(target, forum_id, title, body, has_image, sent_at, message, thread_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     target,
                     entry.forum_id,
@@ -381,7 +403,8 @@ impl HistoryStore {
                     entry.body,
                     entry.has_image,
                     entry.sent_at,
-                    entry.message
+                    entry.message,
+                    thread_id
                 ],
             )
             .context("record successful post")?;
@@ -632,6 +655,63 @@ mod tests {
     }
 
     #[test]
+    fn schema_one_migration_preserves_post_categories_and_unknown_destinations() {
+        let db = TestDb::new();
+        fs::create_dir_all(&db.0).unwrap();
+        {
+            let connection = Connection::open(db.path()).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE posting (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        target INTEGER CHECK(target >= 0), forum_id INTEGER NOT NULL,
+                        title TEXT NOT NULL, body TEXT NOT NULL, has_image INTEGER NOT NULL,
+                        sent_at INTEGER NOT NULL, message TEXT NOT NULL
+                    );
+                    CREATE INDEX posting_by_send ON posting(sent_at DESC, id DESC);
+                    INSERT INTO posting VALUES (1, NULL, 4, 'thread', 'old thread', 0, 10, 'ok');
+                    INSERT INTO posting VALUES (2, 50, 4, '', 'old reply', 1, 20, 'ok');
+                    PRAGMA user_version = 1;",
+                )
+                .unwrap();
+        }
+        {
+            let store = db.open();
+            let version: u32 = store
+                .connection()
+                .unwrap()
+                .pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap();
+            assert_eq!(version, 2);
+            let threads = store.list(HistoryCategory::Threads, 10, 0).unwrap();
+            assert!(matches!(&threads[..], [HistoryEntry::Posted(entry)]
+                if entry.id == 1 && entry.body == "old thread"
+                    && entry.target.is_none() && entry.thread_id.is_none()));
+            let replies = store.list(HistoryCategory::Replies, 10, 0).unwrap();
+            assert!(matches!(&replies[..], [HistoryEntry::Posted(entry)]
+                if entry.id == 2 && entry.body == "old reply" && entry.has_image
+                    && entry.target == Some(50) && entry.thread_id.is_none()));
+            store
+                .record_post(&PostingEntry {
+                    thread_id: Some(70),
+                    body: "new thread".into(),
+                    sent_at: 30,
+                    ..PostingEntry::default()
+                })
+                .unwrap();
+        }
+        let store = db.open();
+        let threads = store.list(HistoryCategory::Threads, 10, 0).unwrap();
+        assert_eq!(threads.len(), 2);
+        assert!(matches!(&threads[0], HistoryEntry::Posted(entry)
+            if entry.id == 3 && entry.thread_id == Some(70) && entry.target.is_none()));
+        assert_eq!(
+            store.list(HistoryCategory::Replies, 10, 0).unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
     fn reopen_preserves_snapshots_visits_positions_and_successful_posts() {
         let db = TestDb::new();
         let position = ReadingPosition {
@@ -663,6 +743,7 @@ mod tests {
                 .unwrap();
             store
                 .record_post(&PostingEntry {
+                    thread_id: Some(90),
                     title: "sent title".into(),
                     body: "sent body".into(),
                     sent_at: 42,
@@ -685,6 +766,8 @@ mod tests {
             panic!("expected posted history")
         };
         assert!(entry.id > 0);
+        assert_eq!(entry.thread_id, Some(90));
+        assert_eq!(entry.target, None);
         assert_eq!(entry.body, "sent body");
         assert!(entry.has_image);
         assert_eq!(entry.message, "success");
@@ -743,6 +826,7 @@ mod tests {
             store
                 .record_post(&PostingEntry {
                     target,
+                    thread_id: Some(target.unwrap_or(90)),
                     sent_at,
                     body: body.into(),
                     ..PostingEntry::default()
@@ -759,7 +843,8 @@ mod tests {
             .collect();
         assert_eq!(bodies, ["last", "first", "older"]);
         let replies = store.list(HistoryCategory::Replies, 10, 0).unwrap();
-        assert!(matches!(&replies[0], HistoryEntry::Posted(entry) if entry.target == Some(5)));
+        assert!(matches!(&replies[0], HistoryEntry::Posted(entry)
+            if entry.target == Some(5) && entry.thread_id == Some(5)));
         assert_eq!(replies.len(), 1);
     }
 
@@ -838,6 +923,20 @@ mod tests {
         assert!(
             store
                 .list(HistoryCategory::Replies, 10, 0)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .record_post(&PostingEntry {
+                    thread_id: Some(u64::MAX),
+                    ..PostingEntry::default()
+                })
+                .is_err()
+        );
+        assert!(
+            store
+                .list(HistoryCategory::Threads, 10, 0)
                 .unwrap()
                 .is_empty()
         );

@@ -23,6 +23,13 @@ pub const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 /// The service accepts arbitrary IDs; this client bounds settings and request size.
 pub const MAX_SUBSCRIPTION_ID_CHARS: usize = 256;
 
+/// Confirmed posting message, with the created thread when the response names it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PostingResult {
+    pub message: String,
+    pub thread_id: Option<u64>,
+}
+
 pub fn validate_subscription_id(value: &str) -> Result<&str> {
     let value = value.trim();
     if value.is_empty() {
@@ -391,6 +398,44 @@ impl ApiClient {
         content: &str,
         image: Option<&ImageAttachment>,
     ) -> Result<String> {
+        self.send_thread(fid, name, title, content, image)
+            .map(|result| result.message)
+    }
+
+    /// Send once, then resolve an omitted destination using the authenticated
+    /// recent-post endpoint on the same website immediately after success.
+    /// A failed or mismatched lookup still preserves the confirmed success.
+    pub fn post_thread_with_image_result(
+        &self,
+        fid: i64,
+        name: &str,
+        title: &str,
+        content: &str,
+        image: Option<&ImageAttachment>,
+    ) -> Result<PostingResult> {
+        let mut result = self.send_thread(fid, name, title, content, image)?;
+        if result.thread_id.is_none() {
+            // This is a read, never a retry of the successful POST. The endpoint
+            // can expire or return a concurrent reply; neither invalidates success.
+            result.thread_id = self
+                .read::<Value>(
+                    self.client
+                        .get(format!("{}Api/getLastPost", self.website_base)),
+                )
+                .ok()
+                .and_then(|value| last_posted_thread_id(&value, fid, title, content));
+        }
+        Ok(result)
+    }
+
+    fn send_thread(
+        &self,
+        fid: i64,
+        name: &str,
+        title: &str,
+        content: &str,
+        image: Option<&ImageAttachment>,
+    ) -> Result<PostingResult> {
         if fid <= 0 {
             bail!("请选择有效版面");
         }
@@ -429,6 +474,7 @@ impl ApiClient {
             content,
             image,
         )
+        .map(|result| result.message)
     }
 
     fn post(
@@ -439,7 +485,7 @@ impl ApiClient {
         title: &str,
         content: &str,
         image: Option<&ImageAttachment>,
-    ) -> Result<String> {
+    ) -> Result<PostingResult> {
         if !self.has_cookie {
             bail!("发串或回复需要配置 userhash 饼干");
         }
@@ -493,11 +539,48 @@ impl ApiClient {
                 response.status()
             );
         }
+        let response_url = response.url().clone();
         let body = response
             .text()
             .context("无法读取发送结果，请刷新核实是否已发出")?;
-        parse_post_response(&body)
+        parse_posting_result(&body, &response_url)
     }
+}
+
+fn last_posted_thread_id(value: &Value, fid: i64, title: &str, content: &str) -> Option<u64> {
+    fn unsigned(value: &Value) -> Option<u64> {
+        value.as_u64().or_else(|| value.as_str()?.parse().ok())
+    }
+    fn normalize(value: &str) -> String {
+        value
+            .replace("\r\n", "\n")
+            .replace('\r', "\n")
+            .trim()
+            .to_owned()
+    }
+
+    let id = unsigned(value.get("id")?).filter(|id| *id > 0)?;
+    // `resto` is required: a missing field must not turn a reply into a thread.
+    if unsigned(value.get("resto")?)? != 0 {
+        return None;
+    }
+    if let Some(actual_fid) = value.get("fid")
+        && unsigned(actual_fid)? != u64::try_from(fid).ok()?
+    {
+        return None;
+    }
+    let expected_title = normalize(title);
+    let expected_title = if expected_title.is_empty() {
+        "无标题"
+    } else {
+        &expected_title
+    };
+    let actual_title = normalize(&html_to_text(value.get("title")?.as_str()?));
+    let actual_content = normalize(&html_to_text(value.get("content")?.as_str()?));
+    if actual_title != expected_title || actual_content != normalize(content) {
+        return None;
+    }
+    Some(id)
 }
 
 fn parse_subscription_response(value: Value, expected: &str) -> Result<String> {
@@ -548,6 +631,106 @@ fn parse_post_response(body: &str) -> Result<String> {
     success
         .filter(|s| !s.is_empty())
         .ok_or_else(|| anyhow!("未能确认发送结果，请刷新原串或版面核实后再决定是否重试"))
+}
+
+fn parse_posting_result(body: &str, response_url: &reqwest::Url) -> Result<PostingResult> {
+    // A destination is useful only after the existing explicit success check.
+    let message = parse_post_response(body)?;
+    let mut ids = Vec::new();
+    if let Some(id) = posting_thread_destination(response_url.as_str(), response_url) {
+        ids.push(id);
+    }
+    static DESTINATION_TAG: OnceLock<Regex> = OnceLock::new();
+    let tags = DESTINATION_TAG.get_or_init(|| {
+        // Skip comments and script/style contents: strings inside them are not links.
+        Regex::new(
+            r#"(?is)<!--.*?-->|<script\b[^>]*>.*?</script\s*>|<style\b[^>]*>.*?</style\s*>|<(a|meta)\b(?:[^>\"']|\"[^\"]*\"|'[^']*')*>"#,
+        )
+        .unwrap()
+    });
+    for capture in tags.captures_iter(body) {
+        let Some(kind) = capture.get(1) else {
+            continue;
+        };
+        let tag = capture.get(0).unwrap().as_str();
+        let destination = if kind.as_str().eq_ignore_ascii_case("a") {
+            // ThinkPHP's success template gives its jump link the ID `href`.
+            // Other anchors can be navigation or user references, so ignore them.
+            posting_html_attribute(tag, "id")
+                .filter(|id| id == "href")
+                .and_then(|_| posting_html_attribute(tag, "href"))
+        } else {
+            posting_html_attribute(tag, "http-equiv")
+                .filter(|value| value.eq_ignore_ascii_case("refresh"))
+                .and_then(|_| posting_html_attribute(tag, "content"))
+                .and_then(|content| {
+                    let (delay, destination) = content.split_once(';')?;
+                    delay.trim().parse::<u64>().ok()?;
+                    let (key, value) = destination.trim().split_once('=')?;
+                    key.trim()
+                        .eq_ignore_ascii_case("url")
+                        .then(|| value.trim().trim_matches(['\'', '"']).to_owned())
+                })
+        };
+        if let Some(id) = destination
+            .as_deref()
+            .and_then(|value| posting_thread_destination(value, response_url))
+        {
+            ids.push(id);
+        }
+    }
+    let thread_id = ids
+        .first()
+        .copied()
+        .filter(|first| ids.iter().all(|id| id == first));
+    Ok(PostingResult { message, thread_id })
+}
+
+fn posting_html_attribute(tag: &str, name: &str) -> Option<String> {
+    static ATTRIBUTE: OnceLock<Regex> = OnceLock::new();
+    let attributes = ATTRIBUTE.get_or_init(|| {
+        Regex::new(
+            r#"(?is)([a-z_:][a-z0-9_.:-]*)\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s'\"=<>`]+))"#,
+        )
+        .unwrap()
+    });
+    let mut matching = attributes
+        .captures_iter(tag)
+        .filter(|capture| capture[1].eq_ignore_ascii_case(name));
+    let capture = matching.next()?;
+    // Duplicate destination attributes are malformed; do not choose between them.
+    if matching.next().is_some() {
+        return None;
+    }
+    let value = capture
+        .get(2)
+        .or_else(|| capture.get(3))
+        .or_else(|| capture.get(4))?;
+    Some(html_escape::decode_html_entities(value.as_str()).into_owned())
+}
+
+fn posting_thread_destination(value: &str, response_url: &reqwest::Url) -> Option<u64> {
+    let value = value.trim();
+    if value.contains('\\') || value.chars().any(char::is_control) {
+        return None;
+    }
+    let destination = response_url.join(value).ok()?;
+    if !matches!(destination.scheme(), "http" | "https")
+        || destination.origin() != response_url.origin()
+        || !destination.username().is_empty()
+        || destination.password().is_some()
+    {
+        return None;
+    }
+    let path = destination
+        .path()
+        .strip_prefix("/t/")?
+        .trim_end_matches('/');
+    let id = path.strip_suffix(".html").unwrap_or(path);
+    if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    id.parse::<u64>().ok().filter(|id| *id > 0)
 }
 
 #[cfg(test)]
@@ -986,6 +1169,133 @@ mod tests {
     }
 
     #[test]
+    fn thread_post_result_retains_the_success_destination_without_another_request() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_mock_request(&mut stream);
+            let body = "<p class='success'>发串成功</p><a id='href' href='/t/123.html'>跳转</a>";
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+            request
+        });
+        let mut api = ApiClient::new(Some("test-only-cookie")).unwrap();
+        api.website_base = format!("http://{address}/");
+        let result = api
+            .post_thread_with_image_result(117, "", "", "hello", None)
+            .unwrap();
+        assert_eq!(result.message, "发串成功");
+        assert_eq!(result.thread_id, Some(123));
+        assert!(
+            server
+                .join()
+                .unwrap()
+                .starts_with("POST /home/forum/doPostThread.html HTTP/1.1")
+        );
+    }
+
+    #[test]
+    fn thread_post_resolves_an_empty_jump_link_with_one_authenticated_read() {
+        use std::io::Write;
+        for (status, last_post, expected_id) in [
+            (
+                "200 OK",
+                r#"{"id":"123","resto":"0","fid":"117","title":"无标题","content":"hello &amp; 中文<br />\r\nsecond line"}"#,
+                Some(123),
+            ),
+            ("200 OK", "[]", None),
+            ("200 OK", "not JSON", None),
+            ("503 Service Unavailable", "unavailable", None),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let mut requests = Vec::new();
+                for (status, body) in [
+                    (
+                        "200 OK",
+                        "<p class='success'>发串成功</p><a id='href' href=''>跳转</a>",
+                    ),
+                    (status, last_post),
+                ] {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    requests.push(read_mock_request(&mut stream));
+                    write!(
+                        stream,
+                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len(),
+                    )
+                    .unwrap();
+                }
+                requests
+            });
+            let mut api = ApiClient::new(Some("test-only-cookie")).unwrap();
+            api.website_base = format!("http://{address}/");
+            let result = api
+                .post_thread_with_image_result(117, "", "", "hello & 中文\r\nsecond line", None)
+                .unwrap();
+            assert_eq!(result.message, "发串成功");
+            assert_eq!(result.thread_id, expected_id);
+            let requests = server.join().unwrap();
+            assert!(requests[0].starts_with("POST /home/forum/doPostThread.html HTTP/1.1"));
+            assert!(requests[1].starts_with("GET /Api/getLastPost HTTP/1.1"));
+            for request in requests {
+                assert!(
+                    request
+                        .to_ascii_lowercase()
+                        .contains("cookie: userhash=test-only-cookie")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn recent_post_must_identify_the_submitted_thread() {
+        let valid = json!({
+            "id": 123,
+            "resto": 0,
+            "title": "title &amp; &lt;literal&gt;",
+            "content": "hello &amp; &lt;literal&gt;",
+        });
+        let title = "title & <literal>";
+        let content = "hello & <literal>";
+        assert_eq!(
+            last_posted_thread_id(&valid, 117, title, content),
+            Some(123)
+        );
+        for (key, invalid) in [
+            ("id", json!(0)),
+            ("id", json!(-1)),
+            ("resto", json!(456)),
+            ("resto", Value::Null),
+            ("fid", json!(4)),
+            ("fid", Value::Null),
+            ("title", json!("another title")),
+            ("content", json!("another post")),
+        ] {
+            let mut value = valid.clone();
+            value[key] = invalid;
+            assert_eq!(
+                last_posted_thread_id(&value, 117, title, content),
+                None,
+                "{value}"
+            );
+        }
+        for required in ["id", "resto", "title", "content"] {
+            let mut value = valid.clone();
+            value.as_object_mut().unwrap().remove(required);
+            assert_eq!(last_posted_thread_id(&value, 117, title, content), None);
+        }
+    }
+
+    #[test]
     fn image_posts_use_multipart_and_preserve_server_errors() {
         use std::io::Write;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1138,6 +1448,67 @@ mod tests {
         assert!(
             parse_post_response("<p class='success'>ok</p><p class='error'>failure</p>").is_err()
         );
+    }
+
+    #[test]
+    fn posting_result_recognizes_only_explicit_same_origin_thread_destinations() {
+        let response_url =
+            reqwest::Url::parse("https://www.nmbxd1.com/home/forum/doPostThread.html").unwrap();
+        for destination in [
+            "<a id='href' href='/t/123'>跳转</a>",
+            "<A HREF=\"https://www.nmbxd1.com/t/123.html?page=1&amp;from=post\" ID=href>跳转</A>",
+            "<meta content=\"1; URL='/t/123/'\" http-equiv='Refresh'>",
+            "<meta http-equiv=refresh content='0;url=/t/123'><a href='/t/123' id='href'>跳转</a>",
+        ] {
+            let result = parse_posting_result(
+                &format!("<p class='success'>发串成功</p>{destination}"),
+                &response_url,
+            )
+            .unwrap();
+            assert_eq!(result.message, "发串成功");
+            assert_eq!(result.thread_id, Some(123), "{destination}");
+        }
+        let final_url = reqwest::Url::parse("https://www.nmbxd1.com/t/456").unwrap();
+        assert_eq!(
+            parse_posting_result("<p class='success'>ok</p>", &final_url)
+                .unwrap()
+                .thread_id,
+            Some(456)
+        );
+    }
+
+    #[test]
+    fn posting_result_keeps_unknown_ids_unknown_and_does_not_weaken_success_checks() {
+        let response_url =
+            reqwest::Url::parse("https://www.nmbxd1.com/home/forum/doPostThread.html").unwrap();
+        for unrelated in [
+            "No.123 <a href='/t/123'>引用</a>",
+            "<p class='success'><a href='/t/123'>引用</a></p>",
+            "<a id='href' href='https://evil.test/t/123'>跳转</a>",
+            "<a id='href' href='https://www.nmbxd1.com.evil.test/t/123'>跳转</a>",
+            "<a id='href' href='https://user@www.nmbxd1.com/t/123'>跳转</a>",
+            "<a id='href' href='/f/123'>跳转</a>",
+            "<a id='href' href='/t/0'>跳转</a>",
+            "<a id='href' href='/t/18446744073709551616'>跳转</a>",
+            "<a id='href' href='/t/123/other'>跳转</a>",
+            "<a id='href' href='/t/123' href='/t/456'>跳转</a>",
+            "<!-- <a id='href' href='/t/123'>跳转</a> -->",
+            "<script>const text = \"<a id='href' href='/t/123'>跳转</a>\";</script>",
+            "<a id='href' href='/t/123'>跳转</a><meta http-equiv=refresh content='1;url=/t/456'>",
+        ] {
+            let result = parse_posting_result(
+                &format!("<p class='success'>ok</p>{unrelated}"),
+                &response_url,
+            )
+            .unwrap();
+            assert_eq!(result.thread_id, None, "{unrelated}");
+        }
+        for body in [
+            "<a id='href' href='/t/123'>跳转</a>",
+            "<p class='success'>ok</p><p class='error'>failed</p><a id='href' href='/t/123'>跳转</a>",
+        ] {
+            assert!(parse_posting_result(body, &response_url).is_err());
+        }
     }
 
     #[test]

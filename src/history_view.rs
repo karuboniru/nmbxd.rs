@@ -139,9 +139,13 @@ impl Island {
                 }
                 HistoryEntry::Posted(entry) => {
                     let target = entry.target;
-                    let destination = target
-                        .map(|id| format!("回复 No.{id}"))
-                        .unwrap_or_else(|| format!("发串 · 板块 {}", entry.forum_id));
+                    let thread_id = target.or(entry.thread_id);
+                    let destination = target.map(|id| format!("回复 No.{id}")).unwrap_or_else(
+                        || match thread_id {
+                            Some(id) => format!("发串 No.{id} · 板块 {}", entry.forum_id),
+                            None => format!("发串 · 板块 {}", entry.forum_id),
+                        },
+                    );
                     let mut card = card
                         .id(("history-posted", entry.id as u64))
                         .child(
@@ -177,11 +181,19 @@ impl Island {
                                     .child(format!("发送结果：{}", entry.message)),
                             )
                         });
-                    if let Some(id) = target {
+                    if let Some(id) = thread_id {
                         card = card
                             .cursor_pointer()
                             .hover(move |d| d.bg(rgb(p.hover)))
                             .on_click(cx.listener(move |this, _, _, cx| this.open_thread(id, cx)));
+                    } else {
+                        card = card.child(
+                            div()
+                                .mt_3()
+                                .text_xs()
+                                .text_color(rgb(p.muted))
+                                .child("未记录串号，暂无法直接打开"),
+                        );
                     }
                     card.into_any_element()
                 }
