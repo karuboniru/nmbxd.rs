@@ -44,6 +44,7 @@ use rdnmb::{
     APP_ID, APP_NAME,
     api::ApiClient,
     config_paths,
+    forum_cache::ForumCache,
     history::{HistoryCategory, HistoryEntry, HistoryStore, PostingEntry, ReadingPosition},
     model::{ForumGroup, Post, Timeline},
     tree::ThreadTree,
@@ -214,6 +215,17 @@ impl Island {
         })
         .detach();
         let posting_history = history.clone();
+        // Seed the first frame from disk; the normal startup requests still
+        // refresh both lists on every launch without clearing these snapshots.
+        let forum_cache = ForumCache::default();
+        let groups = forum_cache.load_groups();
+        let timelines = forum_cache.load_timelines();
+        let forum_name = groups
+            .iter()
+            .flat_map(|group| &group.forums)
+            .find(|forum| forum.id == 4)
+            .map(|forum| forum.display_name())
+            .unwrap_or_else(|| "综合版1".into());
         let cookie = api.has_cookie();
         let (tx, rx) = mpsc::channel();
         let (out, incoming) = mpsc::channel();
@@ -262,10 +274,22 @@ impl Island {
                         Response::JumpProbe(g, api.thread_page(id, 1).map_err(|e| e.to_string()))
                     }
                     Request::Forums => {
-                        Response::Forums(api.forum_groups().map_err(|e| e.to_string()))
+                        let result = api.forum_groups().map_err(|e| e.to_string());
+                        if let Ok(groups) = &result
+                            && let Err(error) = forum_cache.save_groups(groups)
+                        {
+                            eprintln!("保存板块信息缓存失败：{error}");
+                        }
+                        Response::Forums(result)
                     }
                     Request::Timelines => {
-                        Response::Timelines(api.timelines().map_err(|e| e.to_string()))
+                        let result = api.timelines().map_err(|e| e.to_string());
+                        if let Ok(timelines) = &result
+                            && let Err(error) = forum_cache.save_timelines(timelines)
+                        {
+                            eprintln!("保存时间线信息缓存失败：{error}");
+                        }
+                        Response::Timelines(result)
                     }
                     Request::Timeline(g, id, page) => Response::Forum(
                         g,
@@ -431,14 +455,14 @@ impl Island {
             available_update: None,
             title_drag: false,
             tx,
-            groups: vec![],
+            groups,
             sidebar_sections: sidebar_sections::SidebarSections::default(),
-            timelines: vec![],
+            timelines,
             timeline: None,
             timelines_loading: true,
             timelines_error: None,
             forum: 4,
-            forum_name: "综合版1".into(),
+            forum_name,
             threads: vec![],
             forum_page: 0,
             forum_epoch: 1,
@@ -528,7 +552,18 @@ impl Island {
             Response::Forums(result) => {
                 self.groups_loading = false;
                 match result {
-                    Ok(groups) => self.groups = groups,
+                    Ok(groups) => {
+                        if !self.showing_subscriptions
+                            && self.timeline.is_none()
+                            && let Some(forum) = groups
+                                .iter()
+                                .flat_map(|group| &group.forums)
+                                .find(|forum| forum.id == self.forum)
+                        {
+                            self.forum_name = forum.display_name();
+                        }
+                        self.groups = groups;
+                    }
                     Err(e) => self.notice = e,
                 }
             }

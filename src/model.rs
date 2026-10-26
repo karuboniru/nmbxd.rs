@@ -57,7 +57,7 @@ fn nullable_vec<'de, D: Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<
     Ok(Option::<Vec<T>>::deserialize(d)?.unwrap_or_default())
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct ForumGroup {
     #[serde(deserialize_with = "integer")]
     pub id: i64,
@@ -67,7 +67,7 @@ pub struct ForumGroup {
     pub forums: Vec<Forum>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct Forum {
     #[serde(deserialize_with = "integer")]
     pub id: i64,
@@ -92,7 +92,7 @@ impl Forum {
 }
 
 /// Timelines aggregate multiple forums and have their own IDs and page limits.
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct Timeline {
     #[serde(deserialize_with = "integer")]
     pub id: i64,

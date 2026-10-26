@@ -98,7 +98,11 @@ impl Island {
                     .py_2()
                     .text_xs()
                     .text_color(rgb(p.muted))
-                    .child("正在获取时间线…"),
+                    .child(if self.timelines.is_empty() {
+                        "正在获取时间线…"
+                    } else {
+                        "正在更新时间线…"
+                    }),
             );
         } else if let Some(error) = &self.timelines_error {
             sidebar = sidebar
