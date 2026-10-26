@@ -35,6 +35,24 @@ jobs:
         with:
           persist-credentials: false
 
+      # Release publication requires this job, so validate once before building.
+      - name: Check release tag matches package version
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && matrix.arch == 'x86_64'
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import tomllib
+
+          with open("Cargo.toml", "rb") as manifest:
+              version = tomllib.load(manifest)["package"]["version"]
+          tag = os.environ["RELEASE_TAG"]
+          if tag.removeprefix("v") != version:
+              raise SystemExit(f"Release tag {tag!r} does not match Cargo.toml version {version!r}")
+          print(f"Release tag {tag!r} matches package version {version}")
+          PY
+
       - name: Install native dependencies
         run: |
           sudo apt-get update

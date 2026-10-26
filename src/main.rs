@@ -125,6 +125,7 @@ struct Island {
     settings_panel: Option<Entity<SettingsPanel>>,
     settings_saving: bool,
     appearance: Appearance,
+    available_update: Option<String>,
     title_drag: bool,
     tx: mpsc::Sender<Request>,
     groups: Vec<ForumGroup>,
@@ -188,6 +189,7 @@ impl Island {
     ) -> Self {
         let appearance = Appearance::load();
         appearance.apply(window, cx);
+        Self::watch_updates(cx);
         apply_fonts(&settings, cx);
         cx.observe_window_appearance(window, |this, window, cx| {
             if this.appearance == Appearance::System {
@@ -422,6 +424,7 @@ impl Island {
             settings_panel: None,
             settings_saving: false,
             appearance,
+            available_update: None,
             title_drag: false,
             tx,
             groups: vec![],
@@ -1338,6 +1341,54 @@ impl Island {
         cx.notify();
     }
 
+    fn watch_updates(cx: &mut Context<Self>) {
+        cx.spawn(async move |view, cx| {
+            let mut checker = cx
+                .background_executor()
+                .spawn(async { rdnmb::update::UpdateChecker::new() })
+                .await;
+            loop {
+                // Restore the cached notice before waiting for any network I/O.
+                if view
+                    .update(cx, |this, cx| {
+                        let version = checker.available_version();
+                        if this.available_update != version {
+                            this.available_update = version;
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                checker = cx
+                    .background_executor()
+                    .spawn(async move {
+                        checker.check_if_due();
+                        checker
+                    })
+                    .await;
+                if view
+                    .update(cx, |this, cx| {
+                        let version = checker.available_version();
+                        if this.available_update != version {
+                            this.available_update = version;
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                // A short wake interval also handles waking from system sleep.
+                cx.background_executor()
+                    .timer(Duration::from_secs(60))
+                    .await;
+            }
+        })
+        .detach();
+    }
+
     fn header(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let p = Palette::current(cx);
         // GPUI's decoration query is Linux-specific; Windows returns Server even
@@ -1462,7 +1513,27 @@ impl Island {
                                 }
                                 cx.notify();
                             })),
-                    ),
+                    )
+                    .when_some(self.available_update.clone(), |controls, version| {
+                        controls.child(
+                            button(p, "get-update", "获取更新")
+                                .tooltip(move |window, cx| {
+                                    gpui_component::tooltip::Tooltip::new(format!(
+                                        "发现新版本 {version}，前往 GitHub 下载"
+                                    ))
+                                    .build(window, cx)
+                                })
+                                .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                                    window.prevent_default();
+                                    cx.stop_propagation();
+                                })
+                                .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .on_click(|_, _, cx| {
+                                    cx.stop_propagation();
+                                    cx.open_url(rdnmb::update::RELEASE_URL);
+                                }),
+                        )
+                    }),
             )
             .child(
                 div()
