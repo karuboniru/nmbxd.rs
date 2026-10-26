@@ -8,6 +8,7 @@ mod drafts;
 mod emoji;
 #[cfg(not(target_os = "linux"))]
 mod file_dialog;
+mod global_notice_ui;
 mod history_controller;
 mod history_view;
 mod image_actions;
@@ -92,6 +93,7 @@ struct ComposerDraft {
 }
 
 struct Island {
+    global_notice: Option<Entity<global_notice_ui::NoticePanel>>,
     reply_cookies: reply_cookies::ReplyCookies,
     compose_cookie: Option<String>,
     history: Option<HistoryStore>,
@@ -190,6 +192,7 @@ impl Island {
         let appearance = Appearance::load();
         appearance.apply(window, cx);
         Self::watch_updates(cx);
+        Self::check_global_notice(window, cx);
         apply_fonts(&settings, cx);
         cx.observe_window_appearance(window, |this, window, cx| {
             if this.appearance == Appearance::System {
@@ -398,6 +401,7 @@ impl Island {
             ),
         };
         Self {
+            global_notice: None,
             reply_cookies,
             compose_cookie: None,
             history,
@@ -2580,6 +2584,7 @@ impl Render for Island {
                 !self.previews.is_empty() && self.viewing_image.is_none(),
                 |d| d.child(self.preview_overlay(cx)),
             )
+            .when_some(self.global_notice.clone(), |d, panel| d.child(panel))
     }
 }
 
